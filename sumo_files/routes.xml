@@ -1,0 +1,17 @@
+<?xml version="1.0" ?>
+<routes>
+  <vType id="car" accel="2.6" decel="4.5" sigma="0.5" length="5" maxSpeed="13.89"/>
+  <route id="route_ego" edges="east_in west_out"/>
+  <flow id="flow_ew" type="car" from="east_in" to="west_out" begin="5" end="300" vehsPerHour="1800" departLane="best" departSpeed="desired"/>
+  <flow id="flow_we" type="car" from="west_in" to="east_out" begin="5" end="300" vehsPerHour="1800" departLane="best" departSpeed="desired"/>
+  <flow id="flow_ew_r" type="car" from="east_in" to="north_out" begin="5" end="300" vehsPerHour="450" departLane="best" departSpeed="desired"/>
+  <flow id="flow_we_r" type="car" from="west_in" to="south_out" begin="5" end="300" vehsPerHour="450" departLane="best" departSpeed="desired"/>
+  <flow id="flow_ew_l" type="car" from="east_in" to="south_out" begin="5" end="300" vehsPerHour="270" departLane="best" departSpeed="desired"/>
+  <flow id="flow_we_l" type="car" from="west_in" to="north_out" begin="5" end="300" vehsPerHour="270" departLane="best" departSpeed="desired"/>
+  <flow id="flow_ns" type="car" from="north_in" to="south_out" begin="5.5" end="300" vehsPerHour="1800" departLane="best" departSpeed="desired"/>
+  <flow id="flow_sn" type="car" from="south_in" to="north_out" begin="5.5" end="300" vehsPerHour="1800" departLane="best" departSpeed="desired"/>
+  <flow id="flow_ns_r" type="car" from="north_in" to="west_out" begin="5.5" end="300" vehsPerHour="450" departLane="best" departSpeed="desired"/>
+  <flow id="flow_sn_r" type="car" from="south_in" to="east_out" begin="5.5" end="300" vehsPerHour="450" departLane="best" departSpeed="desired"/>
+  <flow id="flow_ns_l" type="car" from="north_in" to="east_out" begin="5.5" end="300" vehsPerHour="270" departLane="best" departSpeed="desired"/>
+  <flow id="flow_sn_l" type="car" from="south_in" to="west_out" begin="5.5" end="300" vehsPerHour="270" departLane="best" departSpeed="desired"/>
+</routes>

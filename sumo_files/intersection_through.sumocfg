@@ -1,0 +1,16 @@
+<?xml version="1.0" ?>
+<configuration>
+  <input>
+    <net-file    value="intersection.net.xml"/>
+    <route-files value="routes_all_movements.xml"/>
+  </input>
+  <time>
+    <begin value="0"/>
+    <end   value="300"/>
+    <step-length value="0.2"/>
+  </time>
+  <report>
+    <no-step-log value="true"/>
+    <verbose     value="false"/>
+  </report>
+</configuration>

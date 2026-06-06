@@ -1,0 +1,9 @@
+{
+  "id": "4way_intersection",
+  "arm_length": 200.0,
+  "lane_width": 3.2,
+  "speed_limit": 13.89,
+  "vehicles_per_hour": 1800,
+  "simulation_duration": 300,
+  "step_length": 0.2
+}

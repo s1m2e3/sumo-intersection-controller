@@ -1,0 +1,8 @@
+<?xml version="1.0" ?>
+<nodes>
+  <node id="center" x="0" y="0" type="priority"/>
+  <node id="north" x="0" y="200.0" type="dead_end"/>
+  <node id="south" x="0" y="-200.0" type="dead_end"/>
+  <node id="east" x="200.0" y="0" type="dead_end"/>
+  <node id="west" x="-200.0" y="0" type="dead_end"/>
+</nodes>

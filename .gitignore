@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+*.egg
+
+# Model checkpoints (large binaries)
+models/checkpoints/
+models/checkpoints_online/
+models/*.pt
+models/*.pth
+
+# SUMO generated files
+sumo_files/routes_*.xml
+sumo_files/bench_*.sumocfg
+sumo_files/baseline_*.sumocfg
+
+# Logs and plots
+logs/
+*.png
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db
