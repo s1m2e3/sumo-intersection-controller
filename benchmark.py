@@ -308,7 +308,7 @@ def _collect_stats_ours() -> tuple[float, int, int, int]:
         snap = build_snapshot(all_vids)
         all_tracked = [v for v, s in snap.vehicle_stream.items() if s in _ALL_MOVEMENTS]
         if all_tracked:
-            a_soc_t, mu_soc_t = compute_social_force_2d(all_tracked, snap)
+            a_soc_t, mu_soc_t, _, _ = compute_social_force_2d(all_tracked, snap)
             soc_map = {vid: (float(a_soc_t[j]), float(mu_soc_t[j]))
                        for j, vid in enumerate(all_tracked)}
         else:

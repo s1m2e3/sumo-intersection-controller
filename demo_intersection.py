@@ -317,7 +317,7 @@ def run(gui: bool = False, flow_vph: int = FLOW_VPH,
             if s in _ALL_MOVEMENTS
         ]
         if all_tracked:
-            a_soc_t, mu_soc_t = compute_social_force_2d(all_tracked, snap)
+            a_soc_t, mu_soc_t, _, _ = compute_social_force_2d(all_tracked, snap)
         else:
             a_soc_t = mu_soc_t = None
 

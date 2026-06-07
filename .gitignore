@@ -7,15 +7,19 @@ __pycache__/
 *.egg
 
 # Model checkpoints (large binaries)
+checkpoints/
 models/checkpoints/
 models/checkpoints_online/
 models/*.pt
 models/*.pth
+*.pt
+*.pth
 
 # SUMO generated files
 sumo_files/routes_*.xml
 sumo_files/bench_*.sumocfg
 sumo_files/baseline_*.sumocfg
+sumo_files/hybrid.sumocfg
 
 # Logs and plots
 logs/
@@ -25,3 +29,5 @@ logs/
 *.log
 .DS_Store
 Thumbs.db
+.claude/
+inputs/

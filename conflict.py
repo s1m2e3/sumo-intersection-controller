@@ -100,6 +100,10 @@ _CROSS_PAIRS: list[tuple[Movement, Movement]] = [
     (("west_in","south_out"), ("south_in","west_out")),    # WE_R x SN_L  (SW)
     (("north_in","west_out"), ("west_in","north_out")),    # NS_R x WE_L  (NW)
     (("south_in","east_out"), ("east_in","south_out")),    # SN_R x EW_L  (SE)
+
+    # left x left (same axis, opposite approaches) — paths cross through junction centre
+    (("east_in","south_out"), ("west_in","north_out")),    # EW_L x WE_L
+    (("north_in","east_out"), ("south_in","west_out")),    # NS_L x SN_L
 ]
 
 

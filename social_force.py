@@ -68,7 +68,10 @@ _THROUGH = frozenset({
 })
 
 # ── hyperparameters ────────────────────────────────────────────────────────────
-SAFE_GAP = 3.5    # s    required time gap between arrivals at crossing
+SAFE_GAP          = 4.0  # s   detection window: conflict force activates within this ETA gap
+YIELD_CONF_SCALE  = 2.0  # s   ETA advantage at which platoon softening reaches full effect
+                          #     Decoupled from SAFE_GAP so wider detection doesn't suppress
+                          #     platoon physics at any given absolute delta.
 A_CROSS  = 8.0    # m/s² max cross-traffic braking
 
 # Platoon packing force
@@ -77,6 +80,11 @@ D_WINDOW   = 80.0  # m   distance from junction within which vehicles count towa
 BETA       = 0.70  # max fraction of yield force a platoon can cancel (0 = off, 1 = full)
 EPSILON_P  = 1.0   # regularisation so two isolated vehicles don't ratio to 0.5
 VEHICLE_LEN = 5.0  # m   approximate vehicle length for bumper-to-bumper gap
+
+# Stream summary normalisation (used by transformer summary token)
+_V_REF  = 13.89          # m/s  reference speed — matches V_MAX in the physics layer
+P_SCALE = 6.0 * _V_REF   # max stream pressure ≈ 6 vehicles at _V_REF, tight-packed (~83)
+N_SCALE = 6.0             # normalise approaching-vehicle count against 6 slots
 
 # Junction centre — crossing point used for all conflict pairs
 _CX = 200.0
@@ -187,6 +195,121 @@ def _stream_pressure(
     return total
 
 
+# ── shared SUMO query (called once per step, shared by social force + summary) ─
+def _query_state(
+    all_ids: list[str],
+) -> tuple[dict, dict, dict, dict]:
+    """Batch-query SUMO for position, speed, heading, and junction status."""
+    pos: dict[str, tuple[float, float]] = {}
+    spd_d: dict[str, float]             = {}
+    e_hat: dict[str, tuple[float, float]] = {}
+    in_jct: dict[str, bool]             = {}
+    for vid in all_ids:
+        px, py    = traci.vehicle.getPosition(vid)
+        spd       = traci.vehicle.getSpeed(vid)
+        ex, ey    = _heading(traci.vehicle.getAngle(vid))
+        road      = traci.vehicle.getRoadID(vid)
+        pos[vid]  = (px, py)
+        spd_d[vid] = spd
+        e_hat[vid] = (ex, ey)
+        in_jct[vid] = road.startswith(":center")
+    return pos, spd_d, e_hat, in_jct
+
+
+# ── stream summary for transformer summary token ───────────────────────────────
+def _stream_summary(
+    ego_id:          str,
+    ego_stream:      tuple,
+    snapshot:        "ConflictSnapshot",
+    pos:             dict,
+    spd_d:           dict,
+    in_jct:          dict,
+    stream_pressure: dict,
+) -> list[float]:
+    """
+    4-dim normalised own-queue context for the transformer summary token.
+
+      [0] P_own / P_SCALE   own stream packing pressure     ∈ [0, 1]
+      [1] n_own / N_SCALE   approaching vehicles, own stream ∈ [0, 1]
+      [2] mean_v / _V_REF   mean speed of own queue
+      [3] v_follower/_V_REF immediate follower speed
+
+    Rival context is returned separately as per-stream tokens by
+    compute_social_force_2d (see rival_tokens in its return tuple).
+    """
+    P     = stream_pressure.get(ego_stream, 0.0)
+    svids = snapshot.stream_vehicles.get(ego_stream, [])
+
+    approaching: list[tuple[float, str, float]] = []
+    for vid_k in svids:
+        if in_jct.get(vid_k, False) or vid_k not in pos:
+            continue
+        px, py = pos[vid_k]
+        d = math.sqrt((_CX - px) ** 2 + (_CY - py) ** 2)
+        approaching.append((d, vid_k, spd_d.get(vid_k, 0.0)))
+    approaching.sort()
+
+    n      = len(approaching)
+    mean_v = sum(v for _, _, v in approaching) / max(n, 1)
+
+    ego_idx = next(
+        (i for i, (_, id_, _) in enumerate(approaching) if id_ == ego_id), None
+    )
+    if ego_idx is not None and ego_idx + 1 < n:
+        v_follower = approaching[ego_idx + 1][2]
+    else:
+        v_follower = spd_d.get(ego_id, 0.0)
+
+    return [
+        min(P / max(P_SCALE, 1.0), 1.0),
+        min(n / N_SCALE, 1.0),
+        mean_v     / _V_REF,
+        v_follower / _V_REF,
+    ]
+
+
+def _build_rival_tokens(
+    c_streams:       frozenset,
+    snapshot:        "ConflictSnapshot",
+    pos:             dict,
+    spd_d:           dict,
+    in_jct:          dict,
+    stream_pressure: dict,
+    mu_per_stream:   dict,
+) -> list[list[float]]:
+    """
+    One 4-dim token per conflicting stream that has vehicles present or urgency > 0.
+
+      [0] P_k / P_SCALE   stream packing pressure        ∈ [0, 1]
+      [1] n_k / N_SCALE   approaching vehicles in stream  ∈ [0, 1]
+      [2] mean_v_k/_V_REF mean speed of stream
+      [3] mu_k            worst conflict gate from this stream ∈ [0, 1]
+
+    Empty streams (no vehicles, no urgency) are omitted — variable length is the
+    transformer's strength. Callers pad to K_MAX with zero rows.
+    """
+    tokens = []
+    for rs in c_streams:
+        rs_vids = snapshot.stream_vehicles.get(rs, [])
+        rs_spds = [
+            spd_d.get(v, 0.0)
+            for v in rs_vids
+            if not in_jct.get(v, False) and v in pos
+        ]
+        n_k   = len(rs_spds)
+        mv_k  = sum(rs_spds) / max(n_k, 1)
+        P_k   = stream_pressure.get(rs, 0.0)
+        mu_k  = mu_per_stream.get(rs, 0.0)
+        if n_k > 0 or mu_k > 0:
+            tokens.append([
+                min(P_k / max(P_SCALE, 1.0), 1.0),
+                min(n_k / N_SCALE, 1.0),
+                mv_k / _V_REF,
+                mu_k,
+            ])
+    return tokens
+
+
 # ── main API ───────────────────────────────────────────────────────────────────
 def compute_social_force_2d(
     tracked:  list[str],
@@ -207,42 +330,34 @@ def compute_social_force_2d(
 
     # ── query SUMO once for all tracked + rival vehicles ─────────────────────
     all_ids = [v for v, s in snapshot.vehicle_stream.items() if s is not None]
+    pos, spd_d, e_hat, in_jct = _query_state(all_ids)
 
-    pos:       dict[str, tuple[float, float]] = {}
-    spd_d:     dict[str, float]               = {}
-    e_hat:     dict[str, tuple[float, float]] = {}
-    in_jct:    dict[str, bool]                = {}   # True if on junction internal lane
-
-    for vid in all_ids:
-        px, py    = traci.vehicle.getPosition(vid)
-        spd       = traci.vehicle.getSpeed(vid)
-        ex, ey    = _heading(traci.vehicle.getAngle(vid))
-        road      = traci.vehicle.getRoadID(vid)
-        pos[vid]  = (px, py)
-        spd_d[vid] = spd
-        e_hat[vid] = (ex, ey)
-        in_jct[vid] = road.startswith(":center")
-
-    # Precompute packing pressure for every stream (used in yield softening)
+    # Packing pressure per stream (used in yield softening and summary token)
     stream_pressure: dict = {
         s: _stream_pressure(s, snapshot, pos, spd_d, in_jct)
         for s in _ALL_MOVEMENTS
     }
 
-    a_out  = [0.0] * N
-    mu_out = [0.0] * N
+    a_out      = [0.0] * N
+    mu_out     = [0.0] * N
+    sum_out    = [[0.0] * 4] * N   # own-stream summary token [N, 4]
+    rival_out: list[list[list[float]]] = [[] for _ in range(N)]  # variable K per vehicle
 
     for i, ego_id in enumerate(tracked):
         ego_stream = snapshot.vehicle_stream.get(ego_id)
         if ego_stream not in _ALL_MOVEMENTS or ego_id not in pos:
             continue
 
+        # Own-stream summary: computed regardless of junction state so the model
+        # always has queue context even while clearing the junction.
+        sum_out[i] = _stream_summary(
+            ego_id, ego_stream, snapshot, pos, spd_d, in_jct, stream_pressure
+        )
+
         # Once a vehicle is inside the junction it is committed to its path.
-        # Social force only gates entry; IDM handles clearance from within.
         if in_jct.get(ego_id, False):
             continue
 
-        # Only conflict with other _ALL_MOVEMENTS streams
         c_streams = CONFLICT_MAP.get(ego_stream, frozenset()) & _ALL_MOVEMENTS
         if not c_streams:
             continue
@@ -253,11 +368,10 @@ def compute_social_force_2d(
 
         best_a  = 0.0
         best_mu = 0.0
+        mu_per_stream: dict = {}   # rival_stream → worst mu from that stream
 
-        # ETA to junction centre
         eta_i = _eta_signed(px_i, py_i, ex_i, ey_i, spd_i, _CX, _CY)
 
-        # Skip if ego already well past the junction
         if eta_i < -SAFE_GAP:
             continue
 
@@ -271,10 +385,6 @@ def compute_social_force_2d(
             ex_j, ey_j = e_hat[rival_id]
             spd_j      = spd_d[rival_id]
 
-            # ETA to junction centre for rival.
-            # Turning vehicles change heading mid-junction, making heading-based
-            # ETA go negative while they're still physically blocking.
-            # Cap at 0: a rival IN the junction is treated as "at the crossing now".
             eta_j = _eta_signed(px_j, py_j, ex_j, ey_j, spd_j, _CX, _CY)
             if in_jct.get(rival_id, False):
                 eta_j = max(eta_j, 0.0)
@@ -282,27 +392,34 @@ def compute_social_force_2d(
             delta = eta_i - eta_j   # positive: ego arrives later → yield
 
             if abs(delta) >= SAFE_GAP:
-                continue             # sufficient gap, no action
+                continue
 
             urgency = 1.0 - abs(delta) / SAFE_GAP
 
             if delta >= 0:           # ego is the yielder
-                # Platoon softening: packed, fast ego stream yields less.
-                # ratio → 0 for lone vehicles (P_ego=0) → original force.
-                # ratio → 1 when ego platoon >> rival  → force reduced by BETA.
+                yield_confidence = min(delta / YIELD_CONF_SCALE, 1.0)
+
                 p_ego   = stream_pressure.get(ego_stream, 0.0)
                 p_rival = stream_pressure.get(rival_stream, 0.0)
                 ratio   = min(p_ego / (p_ego + p_rival + EPSILON_P), 1.0)
-                a_ij    = -A_CROSS * urgency * (1.0 - BETA * ratio)
+                mu_ij   = urgency * (1.0 - BETA * ratio * yield_confidence)
+                a_ij    = -A_CROSS * mu_ij
                 if a_ij < best_a:
                     best_a  = a_ij
-                    best_mu = urgency
-            # passer (delta < 0): no force
+                    best_mu = mu_ij
+                # Track per-stream worst urgency for the rival token
+                if mu_ij > mu_per_stream.get(rival_stream, 0.0):
+                    mu_per_stream[rival_stream] = mu_ij
 
-        a_out[i]  = best_a
-        mu_out[i] = best_mu
+        a_out[i]     = best_a
+        mu_out[i]    = best_mu
+        rival_out[i] = _build_rival_tokens(
+            c_streams, snapshot, pos, spd_d, in_jct, stream_pressure, mu_per_stream
+        )
 
     return (
-        torch.tensor(a_out,  dtype=torch.float32),
-        torch.tensor(mu_out, dtype=torch.float32),
+        torch.tensor(a_out,   dtype=torch.float32),          # [N]           braking (m/s²)
+        torch.tensor(mu_out,  dtype=torch.float32),          # [N]           conflict gate
+        torch.tensor(sum_out, dtype=torch.float32),          # [N, 4]        own-stream summary
+        rival_out,                                           # List[List[List[float]]] variable K
     )

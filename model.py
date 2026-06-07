@@ -1,8 +1,35 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-V_TURN_LOW  = 8.0   # m/s — turning gate opens below this speed (no braking needed)
-V_TURN_HIGH = 11.0  # m/s — turning gate fully active above this speed
+V_TURN_LOW  = 8.0    # m/s — turning gate opens below this speed (no braking needed)
+V_TURN_HIGH = 11.0   # m/s — turning gate fully active above this speed
+
+# ── ego-token feature layout (D_EGO = 4, all values normalized ∈ [0,1] or signed) ──
+# slot 0: v / V_MAX                    normalized speed
+# slot 1: min(gap, 100) / 100          normalized gap to leader
+# slot 2: (v − v_lead) / V_MAX         signed closing speed
+# slot 3: max(0, d_jct) / ARM_LENGTH   normalized distance to junction
+D_EGO      = 4
+ARM_LENGTH = 200.0   # m — road arm length used for d_jct normalisation
+
+# ── own-stream summary token layout (D_SUM = 4) ──────────────────────────────
+# slot 0: P_own / P_SCALE              own stream packing pressure ∈ [0, 1]
+# slot 1: n_own / N_SCALE              approaching vehicles in own stream ∈ [0, 1]
+# slot 2: mean_v_own / V_REF           mean speed of own queue
+# slot 3: v_follower / V_REF           immediate follower speed
+D_SUM      = 4       # see social_force._stream_summary
+
+# ── rival-stream token layout (D_RIVAL = 4, one token per conflicting stream) ─
+# slot 0: P_k / P_SCALE                rival stream packing pressure ∈ [0, 1]
+# slot 1: n_k / N_SCALE                approaching vehicles in rival stream ∈ [0, 1]
+# slot 2: mean_v_k / V_REF             mean speed of rival stream
+# slot 3: mu_k                         worst conflict gate from this stream ∈ [0, 1]
+# Streams with no vehicles and no urgency are omitted (variable K per vehicle).
+# Callers pad to K_MAX with zero rows; zero tokens carry no information and
+# the transformer naturally learns to ignore them (zero input → zero after linear).
+D_RIVAL    = 4
+K_MAX      = 8       # upper bound on conflicting streams in a 4-way intersection
 
 # ──────────────────────────────────────────────────────────────────────────────
 # IDM physics terms (learnable parameters)
@@ -80,25 +107,37 @@ class IDMPhysics(nn.Module):
 # Kernel correction  h_=
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Must match A_CROSS in social_force.py
+U_SOCIAL_ANCHOR = -8.0   # m/s²  — full cross-traffic braking anchor
+
+# Approach gate: mu_wp ramps to 1 within this distance of the junction (m)
+D_APPROACH = 30.0
+
+
 class KernelCorrection(nn.Module):
     """
-    Physics-anchored correction via kernel interpolation.
+    Physics-grounded correction.
 
-    TTC domain partition:
-        [0, 3)   → μ_dec active  →  output anchored to u_dec
-        [3, 5]   → both μ = 0   →  NN f̂_θ works alone (learning region)
-        (5, 6]   → μ_ff ramps   →  output transitioning to u_ff
-        (6, ∞)   → μ_ff = 1     →  output anchored to u_ff
+    u_wp is the unconditional baseline — always present in the output.
+    f_hat is a residual correction the NN adds on top of u_wp.
+    Two gates control how much of that residual is allowed:
 
-    The correction:
-        h_= = μ_dec(z)·(u_dec − f̂_θ) + μ_ff(z)·(u_ff − f̂_θ)
+      μ_wp       = max(μ_dec(TTC*), μ_approach(d_junction))
+                   Suppresses NN residual when following closely or deep in
+                   the approach zone.  At μ_wp = 1 → no NN correction.
 
-    Full model:
-        f = f̂_θ + h_=
-          = (1 − μ_dec − μ_ff)·f̂_θ  +  μ_dec·u_dec  +  μ_ff·u_ff
+      μ_conflict = urgency · (1 − β · platoon_ratio)
+                   Blends output toward u_social when conflict is urgent.
+                   At μ_conflict = 1 → output = u_social regardless of NN.
 
-    K_{zz} = I by construction (inducing points chosen so the kernel matrix
-    is the identity), so K_{zz}^{-1} disappears from the formula.
+    Structure:
+        a_long  = u_wp + (1 − μ_wp) · f̂_θ        # NN corrects around physics
+        output  = (1 − μ_conflict) · a_long
+                +      μ_conflict  · u_social       # conflict overrides toward braking
+
+    Gradient d(output)/d(f̂_θ) = (1 − μ_wp) · (1 − μ_conflict).
+    Non-zero whenever neither gate is fully active.
+    u_wp is always present: even at f̂_θ = 0, output ≥ u_wp · (1 − μ_conflict).
     """
 
     def __init__(self, physics: IDMPhysics, eps: float = 1e-3):
@@ -106,118 +145,45 @@ class KernelCorrection(nn.Module):
         self.physics = physics
         self.eps     = eps
 
+    # ── gate helpers (callable externally) ────────────────────────────────────
+
     def ttc_star(self, v: torch.Tensor, gap: torch.Tensor,
                  v_lead: torch.Tensor) -> torch.Tensor:
-        """
-        Symmetric TTC*:
-            TTC* = |gap| / max(v - v_lead, ε)
-        Using absolute value in the numerator makes the kernel symmetric.
-        When v ≤ v_lead (no approach), dv = ε → TTC* → large → free-flow regime.
-        """
         dv = torch.clamp(v - v_lead, min=self.eps)
         return gap.abs() / dv
 
     @staticmethod
-    def mu_ff(z: torch.Tensor) -> torch.Tensor:
-        """Active in (5, ∞). Zero on [0, 5], ramps to 1 at z = 6."""
-        return torch.clamp(z - 5.0, 0.0, 1.0)
-
-    @staticmethod
     def mu_dec(z: torch.Tensor) -> torch.Tensor:
-        """Active in [0, 3). Equals 1 on [0, 2.5], ramps to 0 at z = 3.
-        Steeper ramp (2x) means full braking held longer before releasing."""
+        """Full at TTC* ≤ 2.5 s, ramps to 0 at TTC* = 3 s."""
         return torch.clamp(2.0 * (3.0 - z), 0.0, 1.0)
 
     @staticmethod
-    def mu_turn(v: torch.Tensor, is_turning: torch.Tensor) -> torch.Tensor:
-        """
-        Active only for turning vehicles (_L / _R streams).
-        Ramps 0 → 1 as speed goes from V_TURN_LOW to V_TURN_HIGH.
-        """
-        ramp = torch.clamp(
-            (v - V_TURN_LOW) / (V_TURN_HIGH - V_TURN_LOW), 0.0, 1.0)
-        return is_turning * ramp
+    def mu_approach(d_junction: torch.Tensor) -> torch.Tensor:
+        """Ramps from 0 at d = D_APPROACH to 1 at the junction entrance."""
+        return torch.clamp(1.0 - d_junction / D_APPROACH, 0.0, 1.0)
 
-    # ── waypoint anchor ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def u_waypoint(
-        v:       torch.Tensor,
-        d_wp:    torch.Tensor,   # distance to waypoint along road (m), > 0
-        v_des:   torch.Tensor,   # desired speed at that waypoint (m/s)
-        omega_n: float = 0.5,    # natural frequency  (rad/s)
-        zeta:    float = 1.2,    # damping ratio (slightly overdamped)
+    def forward(
+        self,
+        f_hat:       torch.Tensor,   # [N]  NN residual ∈ (−2, +2)
+        u_wp:        torch.Tensor,   # [N]  waypoint+IDM baseline (pre-computed)
+        mu_wp:       torch.Tensor,   # [N]  ∈ [0,1]  longitudinal residual gate
+        mu_conflict: torch.Tensor,   # [N]  ∈ [0,1]  conflict blend gate
     ) -> torch.Tensor:
-        """
-        Second-order mass-damped tracking acceleration:
-            a = ω_n² · d_wp + 2ζω_n · (v_des − v)
+        u_social = torch.full_like(f_hat, U_SOCIAL_ANCHOR)
 
-        Position term pulls vehicle toward the waypoint; velocity term regulates
-        speed to v_des.  Clamped to [-3, +2] m/s² to stay within physical limits.
-        """
-        k_p = omega_n ** 2
-        k_d = 2.0 * zeta * omega_n
-        return torch.clamp(k_p * d_wp + k_d * (v_des - v), min=-3.0, max=2.0)
+        # Suppress positive baseline during conflict: if the physics says accelerate
+        # but there is an active conflict, that acceleration is unsafe. We suppress
+        # the positive part of u_wp proportional to mu_conflict — a smooth, differentiable
+        # product that fades to zero at mu_conflict=1 and leaves u_wp unchanged at 0.
+        # This is not a hard clip; it is equivalent to saying the conflict gate also
+        # gates the "accelerate" component of the physics anchor.
+        u_wp_safe = u_wp - torch.relu(u_wp) * mu_conflict
 
-    def forward(self, v: torch.Tensor, gap: torch.Tensor,
-                v_lead: torch.Tensor, f_hat: torch.Tensor,
-                is_turning: torch.Tensor | None = None,
-                social_a:   torch.Tensor | None = None,
-                waypoints:  "list | None"        = None,
-                social_2d:  torch.Tensor | None  = None,
-                mu_social:  torch.Tensor | None  = None) -> torch.Tensor:
-        """
-        waypoints : list of 2 × (d_wp [N], v_des [N]) — closest road waypoints.
-                    When provided, replaces u_ff so waypoint tracking governs
-                    the free-road (TTC* > 5) regime.
+        # Longitudinal: physics always present, NN adds gated residual
+        a_long = u_wp_safe + (1.0 - mu_wp) * f_hat
 
-        social_2d : [N] ≤ 0 — 2-D vector social braking acceleration from
-                    social_force.compute_social_force_2d().
-        mu_social : [N] ∈ [0,1] — kernel membership for social_2d anchor.
-                    Applied as:  h_eq += μ_social · (u_social − f̂_θ)
-                    This is additive alongside μ_dec / μ_ff (no budget gate)
-                    because cross-traffic threats are orthogonal to the
-                    longitudinal IDM regime and must not be suppressed.
-        """
-        z     = self.ttc_star(v, gap, v_lead)
-        μ_ff  = self.mu_ff(z)
-        μ_dec = self.mu_dec(z)
-
-        u_dec = self.physics.u_dec(v, gap, v_lead)
-
-        if waypoints is not None:
-            # Two closest waypoints: compute per-waypoint tracking accelerations,
-            # take the maximum (most favourable for forward progress / speed match).
-            d1, v_des1 = waypoints[0]
-            d2, v_des2 = waypoints[1]
-            u1   = self.u_waypoint(v, d1, v_des1)
-            u2   = self.u_waypoint(v, d2, v_des2)
-            u_ff = torch.max(u1, u2)
-        else:
-            u_ff = self.physics.u_ff(v)
-
-        # in [3,5]: both μ = 0 → h_= = 0 → f = f̂_θ alone
-        h_eq = μ_dec * (u_dec - f_hat) + μ_ff * (u_ff - f_hat)
-
-        if is_turning is not None:
-            # Budget gate: μ_turn only fills the NN-only region so it cannot
-            # stack additively on top of μ_dec or μ_ff and invert f̂_θ.
-            budget   = torch.clamp(1.0 - μ_dec - μ_ff, 0.0, 1.0)
-            μ_t      = self.mu_turn(v, is_turning) * budget
-            u_t      = self.physics.u_turn(v)
-            h_eq     = h_eq + μ_t * (u_t - f_hat)
-
-        if social_a is not None:
-            # Legacy RKHS-based social force — added directly (no membership gate).
-            h_eq = h_eq + social_a
-
-        if social_2d is not None and mu_social is not None:
-            # 2-D vector social force (kernel interpolation anchor).
-            # Pulls output from f̂_θ toward the social braking target u_social,
-            # weighted by how urgently cross-traffic threatens (μ_social).
-            h_eq = h_eq + mu_social * (social_2d - f_hat)
-
-        return h_eq
+        # Conflict: blend a_long toward u_social as urgency rises
+        return (1.0 - mu_conflict) * a_long + mu_conflict * u_social
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -226,69 +192,134 @@ class KernelCorrection(nn.Module):
 
 class HybridModel(nn.Module):
     """
-    Full model combining a GRU-based f̂_θ and the physics-anchored h_=.
+    Physics-grounded hybrid model with transformer over ego history + stream summary.
 
-    f̂_θ is a GRU over the last seq_len observations (v, gap, v_lead),
-    giving the model temporal context: gap trend, leader deceleration,
-    ego momentum — things an instantaneous MLP cannot detect.
+    Token sequence fed to the transformer (no masking, no padding):
+        [ ego_{t-T+1}, ..., ego_{t-1}, ego_t,  stream_summary ]
+          oldest ──────────────────────── newest  spatial context
+          positions 0 ──────────────────── T-1        T
 
-    Input per vehicle: sequence of seq_len × (v, gap, v_lead)
-    Output: scalar acceleration.
+    The most-recent ego token (position T-1) aggregates the full temporal
+    history and the spatial queue context via self-attention, then is read
+    out through a zero-init linear head → f̂_θ ≈ 0 at init.
 
-    Behaviour by TTC* region:
-        [0, 3)  → physics braking   (u_dec)
-        [3, 5]  → learned dynamics  (f̂_θ)
-        (5, ∞)  → physics free-flow (u_ff)
+    Output formula (from KernelCorrection):
+        u_wp_safe = u_wp − relu(u_wp) · μ_conflict   (no acceleration into conflict)
+        a_long    = u_wp_safe + (1 − μ_wp) · f̂_θ
+        output    = (1 − μ_conflict) · a_long + μ_conflict · u_social
+
+    At f̂_θ = 0 → output = physics baseline → untrained model is safe by construction.
     """
 
-    def __init__(self, hidden_dim: int = 64, seq_len: int = 5, **physics_kwargs):
+    def __init__(
+        self,
+        d_model:    int   = 64,
+        nhead:      int   = 4,
+        num_layers: int   = 2,
+        dim_ff:     int   = 128,
+        seq_len:    int   = 10,
+        f_scale:    float = 1.5,   # NN residual bound (m/s²)
+        **physics_kwargs,
+    ):
         super().__init__()
-
-        self.seq_len    = seq_len
+        self.seq_len = seq_len
+        self.f_scale = f_scale
         self.physics    = IDMPhysics(**physics_kwargs)
         self.correction = KernelCorrection(self.physics)
 
-        # GRU f̂_θ: processes last seq_len observations → scalar acceleration
-        self.gru  = nn.GRU(3, hidden_dim, batch_first=True)
-        self.head = nn.Linear(hidden_dim, 1)
+        # Three separate input projections — all project to d_model so tokens
+        # can attend to each other freely in the shared transformer.
+        self.ego_proj   = nn.Linear(D_EGO,   d_model)  # temporal ego history
+        self.sum_proj   = nn.Linear(D_SUM,   d_model)  # own-stream summary
+        self.rival_proj = nn.Linear(D_RIVAL, d_model)  # per rival-stream tokens
 
-    def _f_hat(self, x_seq: torch.Tensor) -> torch.Tensor:
-        """
-        x_seq : [N, seq_len, 3]  —  sequence of (v, gap, v_lead)
-        returns: [N]              —  f̂ ∈ (-2, +2) m/s²
-        """
-        out, _ = self.gru(x_seq)                       # [N, seq_len, hidden_dim]
-        f_raw  = self.head(out[:, -1, :]).squeeze(-1)  # [N], unbounded
-        return torch.tanh(f_raw) * 2.0
+        # Learned positional embeddings: T ego + 1 own-summary + K_MAX rival slots.
+        # Initialised near zero so early training is stable.
+        self.pos_embed = nn.Parameter(torch.zeros(seq_len + 1 + K_MAX, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-    def forward(self, v: torch.Tensor, gap: torch.Tensor,
-                v_lead: torch.Tensor, x_seq: torch.Tensor,
-                is_turning: torch.Tensor | None = None,
-                social_a:   torch.Tensor | None = None,
-                waypoints:  "list | None"        = None,
-                social_2d:  torch.Tensor | None  = None,
-                mu_social:  torch.Tensor | None  = None) -> torch.Tensor:
-        """
-        v, gap, v_lead : [N]             — current timestep scalars
-        x_seq          : [N, seq_len, 3] — last seq_len observations
-        is_turning     : [N] float 0/1   — 1 for _L / _R stream vehicles
-        social_a       : [N] float ≤ 0   — legacy RKHS repulsion (m/s²)
-        waypoints      : list of 2 (d_wp [N], v_des [N]) for closest wps
-        social_2d      : [N] float ≤ 0   — 2-D vector social braking
-        mu_social      : [N] ∈ [0,1]     — kernel membership for social_2d
-        returns        : [N]             — acceleration (m/s²)
-        """
-        f_hat = self._f_hat(x_seq)                      # [N], ∈ (-2, +2)
+        # Pre-norm transformer (norm_first=True) — more stable for small models.
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=0.0, batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
 
-        # Smooth speed cap: suppress positive f̂ as v → v_max
-        v_max = self.physics.v_max.detach()
-        gate  = torch.sigmoid(15.0 * (0.8 - v / v_max))
-        f_hat = f_hat - torch.relu(f_hat) * (1.0 - gate)
+        # Zero-init head → f̂_θ = 0 at init → pure physics baseline from day 0
+        self.head = nn.Linear(d_model, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
 
-        h_eq  = self.correction(v, gap, v_lead, f_hat, is_turning,
-                                social_a=social_a, waypoints=waypoints,
-                                social_2d=social_2d, mu_social=mu_social)
-        return f_hat + h_eq
+    def _f_hat(
+        self,
+        x_seq:         torch.Tensor,   # [N, T, D_EGO]      oldest → newest
+        own_summary:   torch.Tensor,   # [N, D_SUM]          own-stream context
+        rival_tokens:  torch.Tensor,   # [N, K, D_RIVAL]     K rival-stream tokens (padded)
+    ) -> torch.Tensor:
+        """Returns f̂_θ [N] ∈ (−f_scale, +f_scale) m/s².
+
+        Sequence layout (left → right = earlier → later in position):
+          [ ego×T  |  own_summary×1  |  rival_k×K ]
+
+        Read-out: position T-1 (most-recent ego token) — has attended to the full
+        history, own platoon context, and all rival queues via self-attention.
+        Zero-padded rival slots carry all-zero inputs → zero after the linear proj,
+        no information injected (the model learns to ignore them naturally).
+        """
+        T = x_seq.shape[1]
+        K = rival_tokens.shape[1]
+
+        ego_tokens = self.ego_proj(x_seq)                         # [N, T, d]
+        sum_token  = self.sum_proj(own_summary.unsqueeze(1))      # [N, 1, d]
+        riv_tokens = self.rival_proj(rival_tokens)                # [N, K, d]
+
+        ego_tokens = ego_tokens + self.pos_embed[:T]              # [N, T, d]
+        sum_token  = sum_token  + self.pos_embed[T : T + 1]       # [N, 1, d]
+        riv_tokens = riv_tokens + self.pos_embed[T + 1 : T + 1 + K]  # [N, K, d]
+
+        tokens = torch.cat([ego_tokens, sum_token, riv_tokens], dim=1)  # [N, T+1+K, d]
+
+        # Gradient checkpointing: recomputes attention activations during backward
+        # instead of storing them. Saves ~30× memory per step — critical for BPTT
+        # over long windows on the RTX 2050 (4 GB VRAM).
+        if self.training and tokens.requires_grad:
+            out = grad_checkpoint(self.transformer, tokens, use_reentrant=False)
+        else:
+            out = self.transformer(tokens)                               # [N, T+1+K, d]
+
+        h     = out[:, T - 1, :]    # read from last ego token           [N, d]
+        f_raw = self.head(h).squeeze(-1)                                 # [N]
+        return torch.tanh(f_raw) * self.f_scale
+
+    def forward(
+        self,
+        x_seq:         torch.Tensor,   # [N, T, D_EGO]   ego history (normalised)
+        own_summary:   torch.Tensor,   # [N, D_SUM]       own-stream context
+        rival_tokens:  torch.Tensor,   # [N, K, D_RIVAL]  rival-stream tokens (padded to K_MAX)
+        u_wp:          torch.Tensor,   # [N]               physics baseline
+        mu_wp:         torch.Tensor,   # [N]               longitudinal gate
+        mu_conflict:   torch.Tensor,   # [N]               conflict gate
+    ) -> torch.Tensor:
+        """
+        Gradient d(output)/d(θ) = (1−μ_wp)·(1−μ_conflict).
+        Non-zero whenever neither gate is fully clamped.
+        f̂_θ = 0  →  physics baseline exactly (safe at init, safe if NN diverges).
+        """
+        f_hat = self._f_hat(x_seq, own_summary, rival_tokens)
+
+        # x_seq[:, -1, 0] = v_t / V_MAX (most recent normalised speed)
+        v_norm = x_seq[:, -1, 0]
+        v_ms   = v_norm * self.physics.v_max.detach()
+
+        # Suppress upward correction as speed approaches 0.8·v_max
+        gate_up   = torch.sigmoid(15.0 * (0.8 - v_norm))
+        # Suppress downward correction near zero speed (don't hold vehicles stopped)
+        gate_down = torch.sigmoid(15.0 * (v_ms - 1.0))
+
+        f_hat = f_hat - torch.relu( f_hat) * (1.0 - gate_up)
+        f_hat = f_hat - torch.relu(-f_hat) * (1.0 - gate_down)
+
+        return self.correction(f_hat, u_wp, mu_wp, mu_conflict)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
