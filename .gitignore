@@ -31,3 +31,8 @@ logs/
 Thumbs.db
 .claude/
 inputs/
+
+# Generated SUMO co-sim/run artifacts
+sumo_files/_cosim_routes_*.rou.xml
+sumo_files/trip_*.xml
+sumo_files/summary_*.xml

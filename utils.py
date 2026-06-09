@@ -252,12 +252,13 @@ def resolve_cross_accel(ego_d, v_ego, rival_d, rival_v, rival_valid,
 
     a_proceed = torch.full_like(a_yield, a_max)                # ego earliest → clear the box
     a_cross   = torch.where(must_yield, a_yield, a_proceed)
-    return torch.where(any_rival, a_cross, torch.zeros_like(a_cross))
+    a_cross   = torch.where(any_rival, a_cross, torch.zeros_like(a_cross))
+    return a_cross, must_yield
 
 
 # ── iterative safety correction ─────────────────────────────────────────────────
-SAFE_ITERS  = 3      # number of correction passes
-SAFE_STEP   = 0.2    # m/s²  extra braking added per pass while predicted-unsafe
+SAFE_ITERS  = 5      # number of correction passes (±0.2 each → up to ±1.0 m/s²)
+SAFE_STEP   = 0.2    # m/s²  accel adjustment per pass
 SAFE_BUFFER = 0.5    # s     margin added to the footprint collision threshold
 
 
@@ -277,32 +278,44 @@ def _predicted_eta(d, v, a):
 
 
 def iterative_safety_correction(a, v_ego, ego_d, eta_rival, v_rival, delta_worst,
-                                any_rival, step=SAFE_STEP, n_iter=SAFE_ITERS,
-                                buffer=SAFE_BUFFER):
+                                must_yield, any_rival, g, step=SAFE_STEP,
+                                n_iter=SAFE_ITERS, buffer=SAFE_BUFFER, a_max=A_MAX):
     """
-    f_{i+1} = f_i + h(f_i).  The correction h closes the loop on the validated danger
-    signal: predict the ego's arrival under the CURRENT acceleration estimate, and if
-    the predicted time-gap to the worst rival falls inside the FOOTPRINT collision
-    threshold, brake `step` more (h = −step); otherwise h = 0.  Repeated n_iter times,
-    each pass re-reading the corrected acceleration.  Only ever adds braking.
+    f_{i+1} = f_i + h(f_i).  At each pass a vehicle nudges its acceleration by ±`step`
+    in the SAFE direction for its role, re-reading the corrected accel each time:
 
-    Footprint threshold = (L/2)/v_e + (L/2)/v_k + buffer — the speed-dependent gap below
-    which the 5 m footprints overlap (the sharp crash predictor), NOT the conservative
-    δ_safe, so it fires only for actual predicted collisions, not safe-but-close passes.
+      YIELDER (δ_worst > 0, arrives later):  brake −step IF the predicted footprint gap
+        to the worst rival is still unsafe.  Braking → arrives later → gap grows.
 
-    Gated to YIELDERS only (δ_worst > 0 ⇒ ego arrives later).  Braking a PASSER (ego
-    earlier, δ<0) would drag its arrival toward the rival's → more dangerous and it
-    perturbs the FCFS order, so passers are left to clear (their counterpart yields).
+      PASSER  (must_yield == False, earliest of ALL rivals):  accelerate +step IF it
+        stays safe — predicted gap after +step still ≥ threshold, accel ≤ a_max, and
+        longitudinal room (g ≥ 1, else it could rear-end its leader).  Accelerating →
+        arrives earlier → gap grows AND it clears the box sooner.
+
+    Footprint threshold = (L/2)/v_e + (L/2)/v_k + buffer (speed-dependent crash
+    predictor).  The passer gate is must_yield (earliest of EVERYONE), NOT δ_worst<0:
+    a vehicle earlier than its closest rival can still be later than a farther one, and
+    accelerating would then cut in front of the rival it owed a yield to.
     """
-    half     = L_VEH / 2.0
-    is_yield = any_rival & (delta_worst > 0.0)                 # only the later vehicle brakes
-    a_corr   = a
+    half = L_VEH / 2.0
+    thr  = half / v_ego.clamp(min=EPS) + half / v_rival.clamp(min=EPS) + buffer
+    is_yield = any_rival & (delta_worst > 0.0)                 # brake candidates
+    is_pass  = any_rival & (~must_yield) & (g >= 1.0)          # accel candidates (earliest + room)
+
+    a_corr = a
     for _ in range(n_iter):
-        eta_e     = _predicted_eta(ego_d, v_ego, a_corr)
-        thr       = half / v_ego.clamp(min=EPS) + half / v_rival.clamp(min=EPS) + buffer
-        tau_pred  = (eta_e - eta_rival).abs()
-        unsafe    = is_yield & (tau_pred < thr)
-        a_corr    = torch.where(unsafe, a_corr - step, a_corr)
+        # YIELDER: brake more while still predicted-unsafe
+        eta_e    = _predicted_eta(ego_d, v_ego, a_corr)
+        unsafe   = is_yield & ((eta_e - eta_rival).abs() < thr)
+        a_brake  = torch.where(unsafe, a_corr - step, a_corr)
+
+        # PASSER: accelerate if +step keeps it safe and within limits
+        a_try    = a_corr + step
+        eta_e_up = _predicted_eta(ego_d, v_ego, a_try)
+        accel_ok = is_pass & ((eta_e_up - eta_rival).abs() >= thr) & (a_try <= a_max)
+        a_accel  = torch.where(accel_ok, a_try, a_corr)
+
+        a_corr   = torch.where(is_yield, a_brake, a_accel)     # roles are mutually exclusive
     return a_corr
 
 
@@ -406,7 +419,8 @@ def controller_acceleration(
         tau_c, delta_w, eta_w, any_rival, ego_d_sel, v_rival_sel = conflict_time_gap(
             d_conf, v_ego, rival_d, rival_v, rival_valid)
         # η-ordering: satisfy ALL active conflict points with one arrival slot
-        a_cross = resolve_cross_accel(d_conf, v_ego, rival_d, rival_v, rival_valid)
+        a_cross, must_yield = resolve_cross_accel(
+            d_conf, v_ego, rival_d, rival_v, rival_valid)
 
     # rival-gated free-flow consequent: collapses a_free → a_cross as a rival nears
     rho        = free_flow_gate(tau_c)
@@ -432,7 +446,8 @@ def controller_acceleration(
     # iterative safety correction: brake harder while the predicted conflict is unsafe
     if safe_iter and rival_d is not None:
         a_raw = iterative_safety_correction(
-            a_raw, v_ego, ego_d_sel, eta_w, v_rival_sel, delta_w, any_rival)
+            a_raw, v_ego, ego_d_sel, eta_w, v_rival_sel, delta_w,
+            must_yield, any_rival, g)
 
     if a_prev is None or kappa >= 1.0:
         return a_raw
