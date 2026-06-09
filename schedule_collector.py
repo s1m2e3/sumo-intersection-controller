@@ -15,8 +15,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import traci
-
 # Reuse route/config writers and path helpers from demo_hybrid
 from demo_hybrid import _write_routes, _write_cfg, _bin, DT, FLOW_VPH
 from conflict import _INCOMING
@@ -40,6 +38,7 @@ class VehicleEntry:
 
 def _get_stream(vid: str) -> tuple | None:
     """Return (from_edge, to_edge) stream for a vehicle, or None if unclassified."""
+    import traci
     route = traci.vehicle.getRoute(vid)
     for i, e in enumerate(route):
         if e in _INCOMING and i + 1 < len(route):
@@ -87,6 +86,7 @@ def collect_schedule(
         "--no-step-log",
         "--seed",              str(seed),
     ]
+    import traci
     traci.start(cmd)
 
     entries:  list[VehicleEntry] = []

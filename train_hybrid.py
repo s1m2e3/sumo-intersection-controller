@@ -57,10 +57,12 @@ N_POOL        = 40      # diverse schedules collected once at startup
 N_EPS         = 8       # parallel episodes per gradient step
 BPTT_WINDOW   = 150     # steps per BPTT window  (150 × 0.2 s = 30 s)
 EPISODE_STEPS = 300     # steps per iteration     (300 × 0.2 s = 60 s)
-LR            = 5e-5
+LR            = 1e-4
 ITERS         = 200
 CHECKPOINT_DIR = Path("checkpoints")
 VALIDATE_EVERY = 10
+LAMBDA_WAIT   = 0.5   # weight on the waiting-time regularizer
+LAMBDA_TTC    = 0.3   # weight on the smooth TTC violation penalty
 
 # ── traffic randomization ranges ──────────────────────────────────────────────
 VPH_MIN    = 300    # minimum total vph
@@ -76,10 +78,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-eps",    type=int,   default=N_EPS)
     p.add_argument("--iters",    type=int,   default=ITERS)
     p.add_argument("--bptt",     type=int,   default=BPTT_WINDOW)
-    p.add_argument("--lr",       type=float, default=LR)
-    p.add_argument("--out",      type=str,   default=str(CHECKPOINT_DIR))
-    p.add_argument("--device",   type=str,   default="")
-    p.add_argument("--validate", action="store_true")
+    p.add_argument("--lr",             type=float, default=LR)
+    p.add_argument("--phys-lr-scale", type=float, default=0.50,
+                   help="LR multiplier for physics-tuning params (default 0.50 = 2× smaller)")
+    p.add_argument("--lambda-wait",   type=float, default=LAMBDA_WAIT,
+                   help="weight on the waiting-time regularizer (default 0.5)")
+    p.add_argument("--lambda-ttc",    type=float, default=LAMBDA_TTC,
+                   help="weight on the smooth TTC violation penalty (default 0.3)")
+    p.add_argument("--out",          type=str,   default=str(CHECKPOINT_DIR))
+    p.add_argument("--device",       type=str,   default="")
+    p.add_argument("--validate",     action="store_true")
     return p.parse_args()
 
 
@@ -184,30 +192,37 @@ def train():
     model = HybridModel(seq_len=10).to(device)
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
 
-    # ── resume from latest.pt ─────────────────────────────────────────────────
-    start_iter  = 0
+    # ── load weights (always train for args.iters fresh iterations) ──────────
     latest_ckpt = out_dir / "latest.pt"
 
     if latest_ckpt.exists():
         state = torch.load(latest_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(state["model"])
-        start_iter = state.get("iter", 0)
-        print(f"  Resuming from iter {start_iter}  (loaded {latest_ckpt.name})")
+        missing, unexpected = model.load_state_dict(state["model"], strict=False)
+        if missing:
+            print(f"  New params (start at nominal): {missing}")
+        print(f"  Loaded weights from {latest_ckpt.name}  (prior iter {state.get('iter', '?')})")
+    else:
+        print("  No checkpoint found — training from scratch")
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Two param groups: transformer at full LR, physics tuning at much smaller LR
+    phys_params = list(model.phys_tune.parameters())
+    phys_ids    = {id(p) for p in phys_params}
+    main_params = [p for p in model.parameters() if id(p) not in phys_ids]
+    optimizer = optim.AdamW([
+        {"params": main_params, "lr": args.lr,                        "weight_decay": 1e-4},
+        {"params": phys_params, "lr": args.lr * args.phys_lr_scale,   "weight_decay": 1e-2},
+    ])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.iters, eta_min=args.lr * 0.05
     )
-    # Fast-forward scheduler to match resumed iter
-    for _ in range(start_iter):
-        scheduler.step()
 
     # ── training loop ─────────────────────────────────────────────────────────
     print(f"\n{'Iter':>6}  {'Win':>5}  {'Step':>6}  "
-          f"{'Speed m/s':>10}  {'Loss':>8}  {'GNorm':>7}  {'Col':>6}  {'t_iter':>7}")
-    print("-" * 72)
+          f"{'Speed':>10}  {'WaitPen':>7}  {'TTCPen':>7}  "
+          f"{'Loss':>8}  {'GNorm':>7}  {'PhysGN':>10}  {'Col':>6}  {'t':>7}")
+    print("-" * 95)
 
-    for iteration in range(start_iter, args.iters):
+    for iteration in range(args.iters):
         # ── sample schedule for this iteration ────────────────────────────────
         ew_vph, ns_vph, sched = rng.choice(pool)
         total_vph = ew_vph + ns_vph
@@ -225,35 +240,54 @@ def train():
 
         iter_speeds: list[float] = []
         iter_losses: list[float] = []
-        window_speeds: list[torch.Tensor] = []
+        window_speeds:    list[torch.Tensor] = []
+        window_wait_pens: list[torch.Tensor] = []
+        window_ttc_pens:  list[torch.Tensor] = []
         win_idx = 0
         optimizer.zero_grad()
 
         for step in range(EPISODE_STEPS):
-            mean_speed = env.step(model)
+            mean_speed, wait_pen, ttc_pen = env.step(model)
             window_speeds.append(mean_speed)
+            window_wait_pens.append(wait_pen)
+            window_ttc_pens.append(ttc_pen)
 
             if (step + 1) % args.bptt == 0 or step == EPISODE_STEPS - 1:
-                speed_window = torch.stack(window_speeds, dim=0)
-                loss = -speed_window.mean()
+                speed_window    = torch.stack(window_speeds,    dim=0)
+                wait_pen_window = torch.stack(window_wait_pens, dim=0)
+                ttc_pen_window  = torch.stack(window_ttc_pens,  dim=0)
+                loss = (-speed_window.mean()
+                        + args.lambda_wait * wait_pen_window.mean()
+                        + args.lambda_ttc  * ttc_pen_window.mean())
 
                 loss.backward()
+
+                # Main grad norm (transformer + physics together)
                 gn = sum(p.grad.norm().item() ** 2
                          for p in model.parameters()
                          if p.grad is not None) ** 0.5
+                # Physics-param grad norm tracked separately
+                phys_gn = sum(p.grad.norm().item() ** 2
+                              for p in model.phys_tune.parameters()
+                              if p.grad is not None) ** 0.5
+
                 clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
-                w_speed = speed_window.mean().item()
-                w_loss  = loss.item()
-                n_col   = env.n_collisions
+                w_speed   = speed_window.mean().item()
+                w_wait    = wait_pen_window.mean().item()
+                w_ttc     = ttc_pen_window.mean().item()
+                w_loss    = loss.item()
+                n_col     = env.n_collisions
                 iter_losses.append(w_loss)
                 iter_speeds.append(w_speed)
 
                 env.n_collisions = 0
                 env.detach()
-                window_speeds = []
+                window_speeds    = []
+                window_wait_pens = []
+                window_ttc_pens  = []
                 win_idx += 1
 
                 t_so_far = time.time() - t_iter
@@ -261,7 +295,8 @@ def train():
 
                 print(f"{iteration+1:>6}  {win_idx:>3}/{n_windows:<2}  "
                       f"{step+1:>6}  "
-                      f"{w_speed:>10.4f}  {w_loss:>8.4f}  {gn:>7.3f}  "
+                      f"{w_speed:>10.4f}  {w_wait:>7.4f}  {w_ttc:>7.4f}  "
+                      f"{w_loss:>8.4f}  {gn:>7.3f}  pgn={phys_gn:.2e}  "
                       f"{col_str}  {t_so_far:>6.1f}s")
 
         avg_speed = sum(iter_speeds) / max(len(iter_speeds), 1)
@@ -271,12 +306,14 @@ def train():
         current_lr = scheduler.get_last_lr()[0]
 
         iter_num = iteration + 1
-        print(f"{'─'*72}")
+        print(f"{'─'*95}")
         print(f"  Iter {iter_num}/{args.iters}  "
               f"vph={total_vph} (ew={ew_vph}/ns={ns_vph})  "
               f"avg={avg_speed:.4f} m/s  "
               f"lr={current_lr:.2e}  ({elapsed:.1f}s)")
-        print(f"{'─'*72}")
+        if iter_num % 10 == 0:
+            print(f"  Physics: {model.phys_tune.summary()}")
+        print(f"{'─'*95}")
 
         # ── checkpoints ───────────────────────────────────────────────────────
         ckpt = {

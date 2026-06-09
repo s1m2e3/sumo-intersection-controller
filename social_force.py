@@ -39,7 +39,6 @@ import math
 
 import numpy as np
 import torch
-import traci
 
 from conflict import CONFLICT_MAP, ConflictSnapshot
 
@@ -68,11 +67,44 @@ _THROUGH = frozenset({
 })
 
 # ── hyperparameters ────────────────────────────────────────────────────────────
-SAFE_GAP          = 4.0  # s   detection window: conflict force activates within this ETA gap
+SAFE_GAP          = 5.0  # s   detection window: conflict force activates within this ETA gap
 YIELD_CONF_SCALE  = 2.0  # s   ETA advantage at which platoon softening reaches full effect
                           #     Decoupled from SAFE_GAP so wider detection doesn't suppress
                           #     platoon physics at any given absolute delta.
-A_CROSS  = 8.0    # m/s² max cross-traffic braking
+A_CROSS    = 3.0  # m/s²  social braking anchor  (a_k for conflict correction)
+A_PUSH     = 3.0  # m/s²  priority push anchor   (a_k for platoon throughput correction)
+TURN_GATE  = SAFE_GAP    # s   rival-ETA window for turn-priority yield rule
+
+# ── in-junction emergency: variable anchor for stopped/slow rivals ─────────────
+# Once inside the junction, ETA is undefined.  We fall back to proximity-based
+# detection and make A_k a function of the rival's speed (variable consequent):
+#   A_k = A_CROSS + (A_JCT_MAX - A_CROSS) * (1 − v_rival / V_SLOW_JCT)
+# so A_k = A_CROSS for a moving rival and A_JCT_MAX for a fully stopped one.
+_D_JCT_EMERG = 20.0  # m    proximity window — detection starts this far out
+_V_SLOW_JCT  = 2.0   # m/s  rival below this speed activates variable anchor
+_A_JCT_MAX   = 6.0   # m/s² peak variable anchor (v_rival = 0)
+
+# ── turn-priority yield rules ──────────────────────────────────────────────────
+# Left turns yield to oncoming through traffic (standard right-of-way).
+# Two right turns yield to the crossing through that physically blocks their path
+# (from network priority matrix: E→N right/S→N through, W→S right/N→S through).
+# N→W right and S→E right have free pass in the network (no conflict with priority
+# through movements) and are intentionally omitted.
+#
+# Membership function:  μ_turn = max(0, 1 − η_rival / TURN_GATE)
+# where η_rival is the rival through vehicle's ETA to the junction centre.
+# Unlike mu_cf (which uses |delta|), this fires on the rival's absolute ETA so
+# the turning vehicle yields regardless of whether it arrives first or second.
+_TURN_YIELD_MAP: dict[tuple, frozenset] = {
+    # left turns — yield to oncoming through
+    ("north_in", "east_out"):  frozenset({("south_in", "north_out")}),
+    ("south_in", "west_out"):  frozenset({("north_in", "south_out")}),
+    ("east_in",  "south_out"): frozenset({("west_in",  "east_out")}),
+    ("west_in",  "north_out"): frozenset({("east_in",  "west_out")}),
+    # right turns — yield to crossing through (from network priority matrix)
+    ("east_in",  "north_out"): frozenset({("south_in", "north_out")}),
+    ("west_in",  "south_out"): frozenset({("north_in", "south_out")}),
+}
 
 # Platoon packing force
 L_GAP      = 12.0  # m   characteristic inter-vehicle spacing; gap ≥ L_GAP → no packing
@@ -83,7 +115,7 @@ VEHICLE_LEN = 5.0  # m   approximate vehicle length for bumper-to-bumper gap
 
 # Stream summary normalisation (used by transformer summary token)
 _V_REF  = 13.89          # m/s  reference speed — matches V_MAX in the physics layer
-P_SCALE = 6.0 * _V_REF   # max stream pressure ≈ 6 vehicles at _V_REF, tight-packed (~83)
+P_SCALE = 2.0 * _V_REF   # saturation at ~3 tight fast vehicles; 6 * → too weak for priority gate
 N_SCALE = 6.0             # normalise approaching-vehicle count against 6 slots
 
 # Junction centre — crossing point used for all conflict pairs
@@ -200,6 +232,7 @@ def _query_state(
     all_ids: list[str],
 ) -> tuple[dict, dict, dict, dict]:
     """Batch-query SUMO for position, speed, heading, and junction status."""
+    import traci
     pos: dict[str, tuple[float, float]] = {}
     spd_d: dict[str, float]             = {}
     e_hat: dict[str, tuple[float, float]] = {}
@@ -340,6 +373,7 @@ def compute_social_force_2d(
 
     a_out      = [0.0] * N
     mu_out     = [0.0] * N
+    mu_prio_out = [0.0] * N        # priority push gate [N]
     sum_out    = [[0.0] * 4] * N   # own-stream summary token [N, 4]
     rival_out: list[list[list[float]]] = [[] for _ in range(N)]  # variable K per vehicle
 
@@ -354,10 +388,6 @@ def compute_social_force_2d(
             ego_id, ego_stream, snapshot, pos, spd_d, in_jct, stream_pressure
         )
 
-        # Once a vehicle is inside the junction it is committed to its path.
-        if in_jct.get(ego_id, False):
-            continue
-
         c_streams = CONFLICT_MAP.get(ego_stream, frozenset()) & _ALL_MOVEMENTS
         if not c_streams:
             continue
@@ -366,8 +396,39 @@ def compute_social_force_2d(
         ex_i, ey_i = e_hat[ego_id]
         spd_i      = spd_d[ego_id]
 
-        best_a  = 0.0
-        best_mu = 0.0
+        # Inside the junction ETA is undefined.  Detect slow/stopped rivals by
+        # proximity and apply a variable emergency brake: A_k scales with rival
+        # slowness so the anchor is fixed for fast traffic and maximal for stopped.
+        if in_jct.get(ego_id, False):
+            best_a = 0.0; best_mu = 0.0
+            for rival_id, rival_stream in snapshot.vehicle_stream.items():
+                if rival_id == ego_id or rival_stream not in c_streams:
+                    continue
+                if rival_id not in pos:
+                    continue
+                v_rival = spd_d.get(rival_id, 0.0)
+                if v_rival >= _V_SLOW_JCT:
+                    continue
+                dist_ij = math.sqrt(
+                    (px_i - pos[rival_id][0]) ** 2 + (py_i - pos[rival_id][1]) ** 2
+                )
+                if dist_ij >= _D_JCT_EMERG:
+                    continue
+                urgency     = 1.0 - dist_ij / _D_JCT_EMERG
+                slow_factor = 1.0 - v_rival / _V_SLOW_JCT
+                A_k  = A_CROSS + (_A_JCT_MAX - A_CROSS) * slow_factor
+                a_ij = -A_k * urgency
+                mu_ij = slow_factor * urgency        # conflict gate fed to kernel
+                if a_ij < best_a:
+                    best_a  = a_ij
+                    best_mu = mu_ij
+            a_out[i]  = best_a
+            mu_out[i] = 0.0   # keep mu_cf=0 so turning/struct anchors stay at full strength
+            continue
+
+        best_a           = 0.0
+        best_mu          = 0.0
+        best_mu_priority = 0.0
         mu_per_stream: dict = {}   # rival_stream → worst mu from that stream
 
         eta_i = _eta_signed(px_i, py_i, ex_i, ey_i, spd_i, _CX, _CY)
@@ -396,7 +457,7 @@ def compute_social_force_2d(
 
             urgency = 1.0 - abs(delta) / SAFE_GAP
 
-            if delta >= 0:           # ego is the yielder
+            if delta >= 0:           # ego is the yielder — apply braking correction
                 yield_confidence = min(delta / YIELD_CONF_SCALE, 1.0)
 
                 p_ego   = stream_pressure.get(ego_stream, 0.0)
@@ -411,15 +472,51 @@ def compute_social_force_2d(
                 if mu_ij > mu_per_stream.get(rival_stream, 0.0):
                     mu_per_stream[rival_stream] = mu_ij
 
-        a_out[i]     = best_a
-        mu_out[i]    = best_mu
+            else:                    # delta < 0: ego has priority — compute push gate
+                prio_conf = min(-delta / YIELD_CONF_SCALE, 1.0)
+                p_ego     = stream_pressure.get(ego_stream, 0.0)
+                mu_prio_ij = urgency * prio_conf * min(p_ego / P_SCALE, 1.0)
+                if mu_prio_ij > best_mu_priority:
+                    best_mu_priority = mu_prio_ij
+
+        # Turn-priority gate — turning vehicles yield to designated through movements
+        # regardless of delta sign.  μ_turn = 1 − η_rival/TURN_GATE fires on the
+        # rival's absolute ETA, not the difference, so the turn always gives way.
+        # Result folds into best_a/best_mu (same A_CROSS anchor → same correction slot).
+        priority_rivals = _TURN_YIELD_MAP.get(ego_stream)
+        if priority_rivals and not in_jct.get(ego_id, False):
+            for rival_id2, rival_stream2 in snapshot.vehicle_stream.items():
+                if rival_stream2 not in priority_rivals or rival_id2 not in pos:
+                    continue
+                px_j2, py_j2 = pos[rival_id2]
+                ex_j2, ey_j2 = e_hat[rival_id2]
+                eta_j2 = _eta_signed(px_j2, py_j2, ex_j2, ey_j2, spd_d[rival_id2], _CX, _CY)
+                if in_jct.get(rival_id2, False):
+                    eta_j2 = max(eta_j2, 0.0)
+                if eta_j2 >= TURN_GATE:
+                    continue
+                mu_turn = max(0.0, 1.0 - eta_j2 / TURN_GATE)
+                a_turn  = -A_CROSS * mu_turn
+                if a_turn < best_a:
+                    best_a  = a_turn
+                    best_mu = max(best_mu, mu_turn)
+                elif mu_turn > best_mu:
+                    best_mu = mu_turn
+                # propagate to rival token so transformer sees the conflict
+                if mu_turn > mu_per_stream.get(rival_stream2, 0.0):
+                    mu_per_stream[rival_stream2] = mu_turn
+
+        a_out[i]        = best_a
+        mu_out[i]       = best_mu
+        mu_prio_out[i]  = best_mu_priority
         rival_out[i] = _build_rival_tokens(
             c_streams, snapshot, pos, spd_d, in_jct, stream_pressure, mu_per_stream
         )
 
     return (
-        torch.tensor(a_out,   dtype=torch.float32),          # [N]           braking (m/s²)
-        torch.tensor(mu_out,  dtype=torch.float32),          # [N]           conflict gate
-        torch.tensor(sum_out, dtype=torch.float32),          # [N, 4]        own-stream summary
-        rival_out,                                           # List[List[List[float]]] variable K
+        torch.tensor(a_out,      dtype=torch.float32),  # [N]    social braking (m/s²)
+        torch.tensor(mu_out,     dtype=torch.float32),  # [N]    conflict gate ∈ [0,1]
+        torch.tensor(mu_prio_out, dtype=torch.float32), # [N]    priority push gate ∈ [0,1]
+        torch.tensor(sum_out,    dtype=torch.float32),  # [N,4]  own-stream summary
+        rival_out,                                      # List[List[List[float]]] variable K
     )

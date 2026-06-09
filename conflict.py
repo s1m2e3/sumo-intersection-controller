@@ -29,8 +29,6 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import NamedTuple
 
-import traci
-import traci_cache
 
 # ---------------------------------------------------------------------------
 # Types
@@ -139,6 +137,7 @@ EXIT_TRACK_DIST = 10.0   # m from junction exit
 
 def is_in_conflict_zone(vid: str) -> bool:
     """True while a vehicle is approaching, inside, or just past the junction box."""
+    import traci_cache
     road = traci_cache.get_road_id(vid)
     if road in _INCOMING or road.startswith(_JUNCTION_PREFIX):
         return True
@@ -170,6 +169,7 @@ def _classify(vid: str) -> Movement | None:
     """Return (from_edge, to_edge) for a vehicle's path through the intersection."""
     if vid in _route_cache:
         return _route_cache[vid]
+    import traci
     route = traci.vehicle.getRoute(vid)
     result = None
     for i, edge in enumerate(route):
