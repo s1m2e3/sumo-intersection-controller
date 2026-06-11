@@ -43,6 +43,7 @@ each other); pass `fresh` to start from the zero-initialized model instead.
 """
 from __future__ import annotations
 import os, sys, time, random
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F_t
@@ -60,6 +61,12 @@ V_PHYS   = S.V_PHYS
 L_VEH    = S.L_VEH
 
 BPTT_K   = 150                  # steps per truncated-BPTT window (15 s, as before)
+GRAD_WARMUP = 10.0              # s — simulate the first seconds WITHOUT building the
+                                #  autograd graph (no loss, no backward): the network
+                                #  starts empty and vehicles need ~18 s to reach the
+                                #  junction, so the early gradient is ~0 (anchors
+                                #  dominate on the approach) — pure compute savings;
+                                #  the trajectory itself is identical either way
 LAM_S    = 0.5                  # safety-hinge weight — sized so a crash-level hinge
                                 #  (~16-47 in the SUMO proxy sweep) costs as much loss
                                 #  as the ENTIRE velocity integral of a clean episode
@@ -182,129 +189,135 @@ def rollout_episode(model, events, geo, s_cp, path_len, s_junc, jgeo, train=True
         s_a, v_a, mv_a = s[act], v[act], move[act]
         ax_a = S._AXIS[mv_a]
 
-        # ── state estimation (mirrors sim_torch.simulate) ──────────────────────
-        same  = mv_a.unsqueeze(0) == mv_a.unsqueeze(1)
-        ahead = s_a.unsqueeze(0) > s_a.unsqueeze(1)
-        eye   = torch.eye(Na, dtype=torch.bool)
-        gap_ij = torch.where(same & ahead & ~eye,
-                             (s_a.unsqueeze(0) - s_a.unsqueeze(1)) - L_VEH,
-                             torch.full((Na, Na), 1e9))
-        gap, li  = gap_ij.min(dim=1)
-        has_lead = gap < 1e8
-        v_lead = torch.where(has_lead, v_a[li], v_a)
-        gap    = torch.where(has_lead, gap.clamp(min=0.0), torch.full((Na,), 300.0))
+        # warm-up: identical simulation, but NO autograd graph and NO loss until
+        # GRAD_WARMUP — the early near-anchor phase contributes ~zero gradient
+        warm = train and (t < GRAD_WARMUP)
+        with (torch.no_grad() if warm else nullcontext()):
+            # ── state estimation (mirrors sim_torch.simulate) ──────────────────
+            same  = mv_a.unsqueeze(0) == mv_a.unsqueeze(1)
+            ahead = s_a.unsqueeze(0) > s_a.unsqueeze(1)
+            eye   = torch.eye(Na, dtype=torch.bool)
+            gap_ij = torch.where(same & ahead & ~eye,
+                                 (s_a.unsqueeze(0) - s_a.unsqueeze(1)) - L_VEH,
+                                 torch.full((Na, Na), 1e9))
+            gap, li  = gap_ij.min(dim=1)
+            has_lead = gap < 1e8
+            v_lead = torch.where(has_lead, v_a[li], v_a)
+            gap    = torch.where(has_lead, gap.clamp(min=0.0), torch.full((Na,), 300.0))
 
-        scp_e = s_cp[mv_a][:, mv_a]
-        scp_r = s_cp.t()[mv_a][:, mv_a]
-        ego_d   = scp_e - s_a.unsqueeze(1)
-        rival_d = scp_r - s_a.unsqueeze(0)
-        rival_v = v_a.unsqueeze(0).expand(Na, Na)
-        valid = ((ax_a.unsqueeze(1) != ax_a.unsqueeze(0)) & ~eye
-                 & (ego_d > 0.0) & (rival_d > -S.CLEAR)
-                 & ~torch.isnan(ego_d) & ~torch.isnan(rival_d))
-        ego_d   = torch.nan_to_num(ego_d, nan=1e3)
-        rival_d = torch.nan_to_num(rival_d, nan=-1e3)
+            scp_e = s_cp[mv_a][:, mv_a]
+            scp_r = s_cp.t()[mv_a][:, mv_a]
+            ego_d   = scp_e - s_a.unsqueeze(1)
+            rival_d = scp_r - s_a.unsqueeze(0)
+            rival_v = v_a.unsqueeze(0).expand(Na, Na)
+            valid = ((ax_a.unsqueeze(1) != ax_a.unsqueeze(0)) & ~eye
+                     & (ego_d > 0.0) & (rival_d > -S.CLEAR)
+                     & ~torch.isnan(ego_d) & ~torch.isnan(rival_d))
+            ego_d   = torch.nan_to_num(ego_d, nan=1e3)
+            rival_d = torch.nan_to_num(rival_d, nan=-1e3)
 
-        # ── cosim-faithful state quantities (centre-based d_junc, ':'-lane in_box,
-        # COUNT platoon pressure in the 0-120 m window, behind_n by d_junc order) ──
-        d_junc = s_center[mv_a] - s_a                            # >0 approaching, <0 past
-        in_box = ((s_a > s_box_in[mv_a]) & (s_a <= s_box_out[mv_a])).tolist()
-        appr    = (d_junc > 0.0) & (d_junc < 120.0)
-        same_ap = same & appr.unsqueeze(0)
-        P        = same_ap.float().sum(dim=1)
-        behind_n = (same_ap & (d_junc.unsqueeze(0) > d_junc.unsqueeze(1))).float().sum(dim=1)
+            # ── cosim-faithful state quantities (centre-based d_junc, ':'-lane in_box,
+            # COUNT platoon pressure in the 0-120 m window, behind_n by d_junc order) ──
+            d_junc = s_center[mv_a] - s_a                        # >0 approaching, <0 past
+            in_box = ((s_a > s_box_in[mv_a]) & (s_a <= s_box_out[mv_a])).tolist()
+            appr    = (d_junc > 0.0) & (d_junc < 120.0)
+            same_ap = same & appr.unsqueeze(0)
+            P        = same_ap.float().sum(dim=1)
+            behind_n = (same_ap & (d_junc.unsqueeze(0) > d_junc.unsqueeze(1))).float().sum(dim=1)
 
-        # ── PRIORITY ESTIMATION WITH MEMORY — identical to cosim_sumo: predecessor_gap
-        # proposes, RoleMemory (latch / queue arbiter / passer-compat arbiter / liveness)
-        # resolves the final roles and the kernel's pred_override ────────────────
-        prop = utils.predecessor_gap(
-            ego_d, v_a, rival_d, rival_v, valid,
-            delta_safe=utils.DELTA_SAFE, ego_P=P,
-            rival_P=P.unsqueeze(0).expand(Na, Na))
-        ids = [int(k) for k in act.tolist()]                     # stable per-episode keys
-        pred_override, roles = role_mem.step(
-            ids, v_a, d_junc, in_box, behind_n, mv_a, ego_d, rival_d, valid,
-            prop, t)
+            # ── PRIORITY ESTIMATION WITH MEMORY — identical to cosim_sumo: predecessor_gap
+            # proposes, RoleMemory (latch / queue arbiter / passer-compat arbiter / liveness)
+            # resolves the final roles and the kernel's pred_override ────────────
+            prop = utils.predecessor_gap(
+                ego_d, v_a, rival_d, rival_v, valid,
+                delta_safe=utils.DELTA_SAFE, ego_P=P,
+                rival_P=P.unsqueeze(0).expand(Na, Na))
+            ids = [int(k) for k in act.tolist()]                 # stable per-episode keys
+            pred_override, roles = role_mem.step(
+                ids, v_a, d_junc, in_box, behind_n, mv_a, ego_d, rival_d, valid,
+                prop, t)
 
-        ctx = mean_net.build_context(v_a, gap, v_lead, P, behind_n, d_junc,
-                                     ego_d, rival_d, valid, roles)
-        mean_fn = model.make_mean_fn(model.encode(*ctx))
+            ctx = mean_net.build_context(v_a, gap, v_lead, P, behind_n, d_junc,
+                                         ego_d, rival_d, valid, roles)
+            mean_fn = model.make_mean_fn(model.encode(*ctx))
 
-        # ── steps 1–3: conditional mean (gradient lives here) ──────────────────
-        a_gp, yield_mask = utils.controller_acceleration(
-            torch.zeros(Na), gap + L_VEH, v_a, v_lead,
-            d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
-            ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
-            a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
-            return_roles=True, pred_override=pred_override, mean_fn=mean_fn)
+            # ── steps 1–3: conditional mean (gradient lives here) ──────────────
+            a_gp, yield_mask = utils.controller_acceleration(
+                torch.zeros(Na), gap + L_VEH, v_a, v_lead,
+                d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
+                ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
+                a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
+                return_roles=True, pred_override=pred_override, mean_fn=mean_fn)
 
-        # ── step 4: gate, straight-through (trajectory feels it, gradient skips it),
-        # with cosim's defer FEEDBACK (gate-deferred passer latched as yielder),
-        # force-rolled protected passers, and POST-GATE liveness — identical to cosim
-        force_roll = torch.tensor([roles[i] == 'pass'
-                                   and role_mem.protected(ids[i], t)
-                                   for i in range(Na)])
-        a_gate, defer = S.rollout_gate(a_gp.detach(), s_a, v_a, mv_a, yield_mask,
-                                       geo, s_junc, return_defer=True,
-                                       force_roll=force_roll)
-        role_mem.gate_feedback(ids, defer, t)
-        role_mem.ensure_passer(ids, roles, defer, in_box, d_junc, t)
-        a = a_gp + (a_gate - a_gp.detach()).detach()
+            # ── step 4: gate, straight-through (trajectory feels it, gradient skips it),
+            # with cosim's defer FEEDBACK (gate-deferred passer latched as yielder),
+            # force-rolled protected passers, and POST-GATE liveness — identical to cosim
+            force_roll = torch.tensor([roles[i] == 'pass'
+                                       and role_mem.protected(ids[i], t)
+                                       for i in range(Na)])
+            a_gate, defer = S.rollout_gate(a_gp.detach(), s_a, v_a, mv_a, yield_mask,
+                                           geo, s_junc, return_defer=True,
+                                           force_roll=force_roll)
+            role_mem.gate_feedback(ids, defer, t)
+            role_mem.ensure_passer(ids, roles, defer, in_box, d_junc, t)
+            a = a_gp + (a_gate - a_gp.detach()).detach()
 
-        # ── cosim's per-vehicle clamps (both differentiable):
-        # YIELDER never accelerates (except in the box — the gate is driving it out);
-        # PASSER keeps moving (V_MIN_PASS) with room ahead
-        yield_t = torch.tensor([roles[i] == 'yield' and not in_box[i]
-                                for i in range(Na)])
-        a = torch.where(yield_t, a.clamp(max=0.0), a)
+            # ── cosim's per-vehicle clamps (both differentiable):
+            # YIELDER never accelerates (except in the box — the gate is driving it out);
+            # PASSER keeps moving (V_MIN_PASS) with room ahead
+            yield_t = torch.tensor([roles[i] == 'yield' and not in_box[i]
+                                    for i in range(Na)])
+            a = torch.where(yield_t, a.clamp(max=0.0), a)
 
-        v_new = (v_a + a * DT).clamp(0.0, V_PHYS)
-        floor_t = torch.tensor([roles[i] == 'pass' and not bool(defer[i])
-                                and float(gap[i]) > 2.0 * L_VEH for i in range(Na)])
-        v_new = torch.where(floor_t, v_new.clamp(min=C.V_MIN_PASS), v_new)
-        s_new = s_a + v_new * DT
+            v_new = (v_a + a * DT).clamp(0.0, V_PHYS)
+            floor_t = torch.tensor([roles[i] == 'pass' and not bool(defer[i])
+                                    and float(gap[i]) > 2.0 * L_VEH for i in range(Na)])
+            v_new = torch.where(floor_t, v_new.clamp(min=C.V_MIN_PASS), v_new)
+            s_new = s_a + v_new * DT
 
-        # ── loss terms ──────────────────────────────────────────────────────────
-        j_step = v_new.sum() * DT                               # ∫Σv dt, this step
-        hinge = torch.zeros(())
-        near = (d_junc.detach() > -S.JCT_PAST) & (d_junc.detach() < 60.0)
-        if int(near.sum()) >= 2:
-            ni = near.nonzero().flatten()
-            xy = torch.zeros(len(ni), 2)
-            for mi in range(4):
-                selm = (mv_a[ni] == mi).nonzero().flatten()
-                if len(selm):
-                    pts, cum = geo[C._MOVES[mi]]
-                    xy[selm], _ = S._interp(pts, cum, s_new[ni][selm] - L_VEH / 2.0)
-            cross = (ax_a[ni].unsqueeze(0) != ax_a[ni].unsqueeze(1))
-            cross = cross & torch.triu(torch.ones_like(cross), 1)
-            if bool(cross.any()):
-                dist = (xy.unsqueeze(0) - xy.unsqueeze(1)).norm(dim=-1)
-                hinge = (F_t.relu(D_HINGE - dist[cross]) ** 2).sum()
-        eff = (a_gp ** 2).mean()
+            # ── loss terms ──────────────────────────────────────────────────────
+            j_step = v_new.sum() * DT                           # ∫Σv dt, this step
+            hinge = torch.zeros(())
+            near = (d_junc.detach() > -S.JCT_PAST) & (d_junc.detach() < 60.0)
+            if int(near.sum()) >= 2:
+                ni = near.nonzero().flatten()
+                xy = torch.zeros(len(ni), 2)
+                for mi in range(4):
+                    selm = (mv_a[ni] == mi).nonzero().flatten()
+                    if len(selm):
+                        pts, cum = geo[C._MOVES[mi]]
+                        xy[selm], _ = S._interp(pts, cum, s_new[ni][selm] - L_VEH / 2.0)
+                cross = (ax_a[ni].unsqueeze(0) != ax_a[ni].unsqueeze(1))
+                cross = cross & torch.triu(torch.ones_like(cross), 1)
+                if bool(cross.any()):
+                    dist = (xy.unsqueeze(0) - xy.unsqueeze(1)).norm(dim=-1)
+                    hinge = (F_t.relu(D_HINGE - dist[cross]) ** 2).sum()
+            eff = (a_gp ** 2).mean()
 
-        # hinge enters as a TIME INTEGRAL (×DT) so its scale — and λ_s's sizing against
-        # the SUMO probe sweep, which also integrates — is independent of the sim step
-        loss_step = (-(j_step / (Ntot * plm))
-                     + LAM_S * hinge * DT / Ntot
-                     + LAM_C * eff / n_steps)
-        loss_win = loss_win + loss_step
-        loss_f  += float(loss_step)
-        j_sum_f += float(j_step); hinge_f += float(hinge) * DT
-        eff_f   += float(eff); eff_n += 1
+            # hinge enters as a TIME INTEGRAL (×DT) so its scale — and λ_s's sizing against
+            # the SUMO probe sweep, which also integrates — is independent of the sim step
+            loss_step = (-(j_step / (Ntot * plm))
+                         + LAM_S * hinge * DT / Ntot
+                         + LAM_C * eff / n_steps)
+            if not warm:
+                loss_win = loss_win + loss_step
+            loss_f  += float(loss_step)
+            j_sum_f += float(j_step); hinge_f += float(hinge) * DT
+            eff_f   += float(eff); eff_n += 1
 
-        # ── functional write-back ───────────────────────────────────────────────
-        s = s.clone(); s[act] = s_new
-        v = v.clone(); v[act] = v_new
-        prev_a = prev_a.clone(); prev_a[act] = a
+            # ── functional write-back ────────────────────────────────────────────
+            s = s.clone(); s[act] = s_new
+            v = v.clone(); v[act] = v_new
+            prev_a = prev_a.clone(); prev_a[act] = a
 
         done = act[s[act] >= path_len[mv_a]]
         state[done] = 2
         arrived += len(done)
 
         # ── truncated BPTT window: backward ACCUMULATES, no optimizer step here ─
-        if train and ((step + 1) % BPTT_K == 0 or step == n_steps - 1):
-            loss_win.backward()
+        if train and not warm and ((step + 1) % BPTT_K == 0 or step == n_steps - 1):
+            if loss_win.requires_grad:
+                loss_win.backward()
             loss_win = torch.zeros(())
             s, v, prev_a = s.detach(), v.detach(), prev_a.detach()
 
