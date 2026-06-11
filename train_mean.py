@@ -11,26 +11,29 @@ Objective:
   route the population completes.  The safety hinge runs over CROSS-axis pairs only;
   the effort term keeps accelerations small unless velocity is actually bought.
 
-Training scheme (epoch = one AVERAGED gradient step):
+Training scheme (one AVERAGED optimizer step per WINDOW_S seconds, batched):
   1. INITIAL CONDITIONS come from SUMO: for each (flow, seed) we run headless SUMO
      once and record every vehicle's ACTUAL realized departure time and movement
      (insertion queueing included) — cached to IC_CACHE so SUMO runs only once.
-  2. Each epoch samples a batch of scenarios from that pool, rolls each through the
-     differentiable PyTorch sim, evaluates the loss (printed per scenario), and
-     calls backward — gradients ACCUMULATE across the whole batch.
-  3. After the batch, gradients are divided by the batch size (averaged), clipped,
-     and ONE optimizer step is taken — so the network fits the population of
-     scenarios, never a single seed.
+  2. Each epoch samples a batch of scenarios and rolls them in LOCKSTEP windows of
+     WINDOW_S sim-seconds: every window, each episode advances WINDOW_S, its window
+     loss backwards (gradients ACCUMULATE across the batch), then the gradients are
+     divided by the batch size, clipped, and ONE optimizer step is taken — ~11
+     averaged updates per epoch instead of 1, for the same simulation compute.
+  3. Later windows of an episode run under the just-updated parameters (standard
+     truncated-BPTT-with-updates); every step is still averaged over the WHOLE
+     batch, so the network never fits a single seed.
 
 Gradient path:
   • differentiable rollout with clone-before-write state updates;
   • the FULL cosim role machinery runs per step (role_memory.RoleMemory: latch,
     queue arbiter, passer-compatibility arbiter, liveness, gate-defer feedback)
-    plus cosim's clamps (yielder a≤0, passer V_MIN_PASS floor) — so training and
-    co-simulation make the SAME inference; all of it is environment (no gradient);
+    plus cosim's clamps (yielder a≤0 unless in-box, passer V_MIN_PASS floor) — so
+    training and co-simulation make the SAME inference; all of it is environment
+    (no gradient);
   • rollout gate applied STRAIGHT-THROUGH (trajectory feels it, gradient skips it);
-  • truncated BPTT: backward every BPTT_K steps (accumulates grads, no opt step),
-    then the state is detached.
+  • the update window IS the truncated-BPTT window (state detached at each step);
+  • the first GRAD_WARMUP seconds simulate identically but build no graph/loss.
 
 Only θ (the MeanTransformer) trains — anchors, K⁻¹, lengthscales, gate untouched.
 
@@ -60,7 +63,10 @@ T_END    = S.T_END
 V_PHYS   = S.V_PHYS
 L_VEH    = S.L_VEH
 
-BPTT_K   = 150                  # steps per truncated-BPTT window (15 s, as before)
+WINDOW_S = 10.0                 # s — one batched, AVERAGED optimizer step per window;
+                                #  this is also the truncated-BPTT span (10 s comfortably
+                                #  covers the gate horizon 4 s and δ_safe 5 s)
+WINDOW_K = int(WINDOW_S / DT)   # steps per window
 GRAD_WARMUP = 10.0              # s — simulate the first seconds WITHOUT building the
                                 #  autograd graph (no loss, no backward): the network
                                 #  starts empty and vehicles need ~18 s to reach the
@@ -140,189 +146,226 @@ def junction_geometry(geo, net_path=S.NET_PATH):
     return s_center, torch.tensor(s_in), torch.tensor(s_out)
 
 
+class EpisodeStepper:
+    """One episode's differentiable rollout, advanced one WINDOW at a time so the
+    caller can batch optimizer updates across episodes every WINDOW_S sim-seconds.
+    Physics, role machinery, gate, and clamps are exactly the per-step pipeline
+    cosim runs — only the stepping is externalized."""
+
+    def __init__(self, events, geo, s_cp, path_len, s_junc, jgeo):
+        from role_memory import RoleMemory   # lazy (role_memory imports cosim_sumo)
+        self.geo, self.s_cp = geo, s_cp
+        self.path_len, self.s_junc = path_len, s_junc
+        self.s_center, self.s_box_in, self.s_box_out = jgeo
+        self.Ntot   = len(events)
+        self.depart = torch.tensor([e[0] for e in events])
+        self.move   = torch.tensor([e[1] for e in events], dtype=torch.long)
+        self.s      = torch.zeros(self.Ntot)
+        self.v      = torch.zeros(self.Ntot)
+        self.state  = torch.zeros(self.Ntot, dtype=torch.long)
+        self.prev_a = torch.zeros(self.Ntot)
+        self.plm    = float(path_len.float().mean())
+        self.role_mem = RoleMemory(dt=DT)    # per-episode stateful role layer (env)
+        self.step_i  = 0
+        self.n_steps = int(T_END / DT)
+        # episode accumulators (floats, reporting only)
+        self.loss_f = self.j_sum_f = self.hinge_f = self.eff_f = 0.0
+        self.eff_n = self.arrived = 0
+
+    def done(self):
+        return self.step_i >= self.n_steps
+
+    def j_norm(self):
+        return self.j_sum_f / (self.Ntot * self.plm)
+
+    def detach(self):
+        """Truncate BPTT at the window boundary."""
+        self.s, self.v = self.s.detach(), self.v.detach()
+        self.prev_a = self.prev_a.detach()
+
+    def advance(self, model, k=WINDOW_K, train=True):
+        """Advance up to k steps.  Returns (window loss TENSOR — graph attached
+        unless the window was all warm-up/empty — window J contribution, window
+        hinge integral).  The caller owns backward / averaging / detach."""
+        loss_win = torch.zeros(())
+        w_j = w_hinge = 0.0
+        end = min(self.step_i + k, self.n_steps)
+        while self.step_i < end:
+            step = self.step_i
+            self.step_i += 1
+            t = step * DT
+
+            # ── spawn (constant writes — no gradient) ──────────────────────────
+            self.s = self.s.clone(); self.v = self.v.clone()
+            for mi in range(4):
+                am = (self.state == 1) & (self.move == mi)
+                min_s = float(self.s[am].min()) if am.any() else 1e9
+                if min_s >= 2.0 * L_VEH + S.SPAWN_GAP:
+                    cand = ((self.state == 0) & (self.move == mi)
+                            & (self.depart <= t)).nonzero().flatten()
+                    if len(cand):
+                        kk = cand[self.depart[cand].argmin()]
+                        if am.any():
+                            v_ld   = float(self.v[am][self.s[am].argmin()])
+                            gap_in = max(min_s - 2.0 * L_VEH, 0.0)
+                            v_safe = (v_ld ** 2 + 2.0 * utils.B_MAX * gap_in) ** 0.5
+                        else:
+                            v_safe = V_PHYS
+                        self.state[kk] = 1
+                        self.s[kk] = L_VEH; self.v[kk] = min(V_PHYS, v_safe)
+
+            act = (self.state == 1).nonzero().flatten()
+            Na = len(act)
+            if Na == 0:
+                continue
+            s_a, v_a, mv_a = self.s[act], self.v[act], self.move[act]
+            ax_a = S._AXIS[mv_a]
+
+            # warm-up: identical simulation, but NO autograd graph and NO loss
+            warm = train and (t < GRAD_WARMUP)
+            with (torch.no_grad() if warm else nullcontext()):
+                # ── state estimation (mirrors sim_torch.simulate) ──────────────
+                same  = mv_a.unsqueeze(0) == mv_a.unsqueeze(1)
+                ahead = s_a.unsqueeze(0) > s_a.unsqueeze(1)
+                eye   = torch.eye(Na, dtype=torch.bool)
+                gap_ij = torch.where(same & ahead & ~eye,
+                                     (s_a.unsqueeze(0) - s_a.unsqueeze(1)) - L_VEH,
+                                     torch.full((Na, Na), 1e9))
+                gap, li  = gap_ij.min(dim=1)
+                has_lead = gap < 1e8
+                v_lead = torch.where(has_lead, v_a[li], v_a)
+                gap    = torch.where(has_lead, gap.clamp(min=0.0),
+                                     torch.full((Na,), 300.0))
+
+                scp_e = self.s_cp[mv_a][:, mv_a]
+                scp_r = self.s_cp.t()[mv_a][:, mv_a]
+                ego_d   = scp_e - s_a.unsqueeze(1)
+                rival_d = scp_r - s_a.unsqueeze(0)
+                rival_v = v_a.unsqueeze(0).expand(Na, Na)
+                valid = ((ax_a.unsqueeze(1) != ax_a.unsqueeze(0)) & ~eye
+                         & (ego_d > 0.0) & (rival_d > -S.CLEAR)
+                         & ~torch.isnan(ego_d) & ~torch.isnan(rival_d))
+                ego_d   = torch.nan_to_num(ego_d, nan=1e3)
+                rival_d = torch.nan_to_num(rival_d, nan=-1e3)
+
+                # cosim-faithful state quantities (centre d_junc, ':'-lane in_box,
+                # COUNT pressure in the 0-120 m window, behind_n by d_junc order)
+                d_junc = self.s_center[mv_a] - s_a               # >0 approaching
+                in_box = ((s_a > self.s_box_in[mv_a])
+                          & (s_a <= self.s_box_out[mv_a])).tolist()
+                appr    = (d_junc > 0.0) & (d_junc < 120.0)
+                same_ap = same & appr.unsqueeze(0)
+                P        = same_ap.float().sum(dim=1)
+                behind_n = (same_ap & (d_junc.unsqueeze(0)
+                                       > d_junc.unsqueeze(1))).float().sum(dim=1)
+
+                # PRIORITY ESTIMATION WITH MEMORY — identical to cosim_sumo
+                prop = utils.predecessor_gap(
+                    ego_d, v_a, rival_d, rival_v, valid,
+                    delta_safe=utils.DELTA_SAFE, ego_P=P,
+                    rival_P=P.unsqueeze(0).expand(Na, Na))
+                ids = [int(x) for x in act.tolist()]             # stable episode keys
+                pred_override, roles = self.role_mem.step(
+                    ids, v_a, d_junc, in_box, behind_n, mv_a, ego_d, rival_d, valid,
+                    prop, t)
+
+                ctx = mean_net.build_context(v_a, gap, v_lead, P, behind_n, d_junc,
+                                             ego_d, rival_d, valid, roles)
+                mean_fn = model.make_mean_fn(model.encode(*ctx))
+
+                # steps 1–3: conditional mean (gradient lives here)
+                a_gp, yield_mask = utils.controller_acceleration(
+                    torch.zeros(Na), gap + L_VEH, v_a, v_lead,
+                    d_conf=ego_d, rival_d=rival_d, rival_v=rival_v,
+                    rival_valid=valid, ego_pressure=P,
+                    rival_pressure=P.unsqueeze(0).expand(Na, Na),
+                    a_prev=self.prev_a[act], kappa=0.5, brake_exempt=True,
+                    return_roles=True, pred_override=pred_override, mean_fn=mean_fn)
+
+                # step 4: gate, straight-through, with defer feedback, force-rolled
+                # protected passers, and POST-GATE liveness — identical to cosim
+                force_roll = torch.tensor([roles[i] == 'pass'
+                                           and self.role_mem.protected(ids[i], t)
+                                           for i in range(Na)])
+                a_gate, defer = S.rollout_gate(a_gp.detach(), s_a, v_a, mv_a,
+                                               yield_mask, self.geo, self.s_junc,
+                                               return_defer=True,
+                                               force_roll=force_roll)
+                self.role_mem.gate_feedback(ids, defer, t)
+                self.role_mem.ensure_passer(ids, roles, defer, in_box, d_junc, t)
+                a = a_gp + (a_gate - a_gp.detach()).detach()
+
+                # cosim's clamps (both differentiable): yielder a≤0 unless in-box;
+                # passer keeps moving (V_MIN_PASS) with room ahead
+                yield_t = torch.tensor([roles[i] == 'yield' and not in_box[i]
+                                        for i in range(Na)])
+                a = torch.where(yield_t, a.clamp(max=0.0), a)
+
+                v_new = (v_a + a * DT).clamp(0.0, V_PHYS)
+                floor_t = torch.tensor([roles[i] == 'pass' and not bool(defer[i])
+                                        and float(gap[i]) > 2.0 * L_VEH
+                                        for i in range(Na)])
+                v_new = torch.where(floor_t, v_new.clamp(min=C.V_MIN_PASS), v_new)
+                s_new = s_a + v_new * DT
+
+                # ── loss terms ──────────────────────────────────────────────────
+                j_step = v_new.sum() * DT                       # ∫Σv dt, this step
+                hinge = torch.zeros(())
+                near = (d_junc.detach() > -S.JCT_PAST) & (d_junc.detach() < 60.0)
+                if int(near.sum()) >= 2:
+                    ni = near.nonzero().flatten()
+                    xy = torch.zeros(len(ni), 2)
+                    for mi in range(4):
+                        selm = (mv_a[ni] == mi).nonzero().flatten()
+                        if len(selm):
+                            pts, cum = self.geo[C._MOVES[mi]]
+                            xy[selm], _ = S._interp(pts, cum,
+                                                    s_new[ni][selm] - L_VEH / 2.0)
+                    cross = (ax_a[ni].unsqueeze(0) != ax_a[ni].unsqueeze(1))
+                    cross = cross & torch.triu(torch.ones_like(cross), 1)
+                    if bool(cross.any()):
+                        dist = (xy.unsqueeze(0) - xy.unsqueeze(1)).norm(dim=-1)
+                        hinge = (F_t.relu(D_HINGE - dist[cross]) ** 2).sum()
+                eff = (a_gp ** 2).mean()
+
+                # hinge enters as a TIME INTEGRAL (×DT) so its scale — and λ_s's
+                # sizing against the SUMO probe sweep — is independent of the step
+                loss_step = (-(j_step / (self.Ntot * self.plm))
+                             + LAM_S * hinge * DT / self.Ntot
+                             + LAM_C * eff / self.n_steps)
+                if not warm:
+                    loss_win = loss_win + loss_step
+                self.loss_f  += float(loss_step)
+                self.j_sum_f += float(j_step)
+                self.hinge_f += float(hinge) * DT
+                self.eff_f   += float(eff); self.eff_n += 1
+                w_j     += float(j_step)
+                w_hinge += float(hinge) * DT
+
+                # ── functional write-back ───────────────────────────────────────
+                self.s = self.s.clone(); self.s[act] = s_new
+                self.v = self.v.clone(); self.v[act] = v_new
+                self.prev_a = self.prev_a.clone(); self.prev_a[act] = a
+
+            done_v = act[self.s[act] >= self.path_len[mv_a]]
+            self.state[done_v] = 2
+            self.arrived += len(done_v)
+        return loss_win, w_j, w_hinge
+
+
 def rollout_episode(model, events, geo, s_cp, path_len, s_junc, jgeo, train=True):
-    """One differentiable episode on a fixed initial-condition schedule, with the
-    FULL cosim role machinery (role_memory.RoleMemory: latch, queue arbiter, passer
-    compatibility arbiter, liveness, gate feedback) and cosim's per-vehicle clamps
-    (yielder no-positive-accel, passer keep-moving floor).
-    If train, calls backward per BPTT window (gradients ACCUMULATE — caller
-    averages and steps).  Returns (loss_total, J_norm, hinge, effort, arrived)."""
-    from role_memory import RoleMemory   # lazy (role_memory imports cosim_sumo)
-    s_center, s_box_in, s_box_out = jgeo
-    Ntot   = len(events)
-    depart = torch.tensor([e[0] for e in events])
-    move   = torch.tensor([e[1] for e in events], dtype=torch.long)
-    s      = torch.zeros(Ntot)
-    v      = torch.zeros(Ntot)
-    state  = torch.zeros(Ntot, dtype=torch.long)
-    prev_a = torch.zeros(Ntot)
-    plm    = float(path_len.float().mean())
-    role_mem = RoleMemory(dt=DT)         # per-episode stateful role layer (env, no grad)
-
-    n_steps = int(T_END / DT)
-    loss_f, j_sum_f, hinge_f, eff_f, eff_n, arrived = 0.0, 0.0, 0.0, 0.0, 0, 0
-    loss_win = torch.zeros(())
-
-    for step in range(n_steps):
-        t = step * DT
-        # ── spawn (constant writes — no gradient) ──────────────────────────────
-        s = s.clone(); v = v.clone()
-        for mi in range(4):
-            am = (state == 1) & (move == mi)
-            min_s = float(s[am].min()) if am.any() else 1e9
-            if min_s >= 2.0 * L_VEH + S.SPAWN_GAP:
-                cand = ((state == 0) & (move == mi) & (depart <= t)).nonzero().flatten()
-                if len(cand):
-                    k = cand[depart[cand].argmin()]
-                    if am.any():
-                        v_ld   = float(v[am][s[am].argmin()])
-                        gap_in = max(min_s - 2.0 * L_VEH, 0.0)
-                        v_safe = (v_ld ** 2 + 2.0 * utils.B_MAX * gap_in) ** 0.5
-                    else:
-                        v_safe = V_PHYS
-                    state[k] = 1; s[k] = L_VEH; v[k] = min(V_PHYS, v_safe)
-
-        act = (state == 1).nonzero().flatten()
-        Na = len(act)
-        if Na == 0:
-            continue
-        s_a, v_a, mv_a = s[act], v[act], move[act]
-        ax_a = S._AXIS[mv_a]
-
-        # warm-up: identical simulation, but NO autograd graph and NO loss until
-        # GRAD_WARMUP — the early near-anchor phase contributes ~zero gradient
-        warm = train and (t < GRAD_WARMUP)
-        with (torch.no_grad() if warm else nullcontext()):
-            # ── state estimation (mirrors sim_torch.simulate) ──────────────────
-            same  = mv_a.unsqueeze(0) == mv_a.unsqueeze(1)
-            ahead = s_a.unsqueeze(0) > s_a.unsqueeze(1)
-            eye   = torch.eye(Na, dtype=torch.bool)
-            gap_ij = torch.where(same & ahead & ~eye,
-                                 (s_a.unsqueeze(0) - s_a.unsqueeze(1)) - L_VEH,
-                                 torch.full((Na, Na), 1e9))
-            gap, li  = gap_ij.min(dim=1)
-            has_lead = gap < 1e8
-            v_lead = torch.where(has_lead, v_a[li], v_a)
-            gap    = torch.where(has_lead, gap.clamp(min=0.0), torch.full((Na,), 300.0))
-
-            scp_e = s_cp[mv_a][:, mv_a]
-            scp_r = s_cp.t()[mv_a][:, mv_a]
-            ego_d   = scp_e - s_a.unsqueeze(1)
-            rival_d = scp_r - s_a.unsqueeze(0)
-            rival_v = v_a.unsqueeze(0).expand(Na, Na)
-            valid = ((ax_a.unsqueeze(1) != ax_a.unsqueeze(0)) & ~eye
-                     & (ego_d > 0.0) & (rival_d > -S.CLEAR)
-                     & ~torch.isnan(ego_d) & ~torch.isnan(rival_d))
-            ego_d   = torch.nan_to_num(ego_d, nan=1e3)
-            rival_d = torch.nan_to_num(rival_d, nan=-1e3)
-
-            # ── cosim-faithful state quantities (centre-based d_junc, ':'-lane in_box,
-            # COUNT platoon pressure in the 0-120 m window, behind_n by d_junc order) ──
-            d_junc = s_center[mv_a] - s_a                        # >0 approaching, <0 past
-            in_box = ((s_a > s_box_in[mv_a]) & (s_a <= s_box_out[mv_a])).tolist()
-            appr    = (d_junc > 0.0) & (d_junc < 120.0)
-            same_ap = same & appr.unsqueeze(0)
-            P        = same_ap.float().sum(dim=1)
-            behind_n = (same_ap & (d_junc.unsqueeze(0) > d_junc.unsqueeze(1))).float().sum(dim=1)
-
-            # ── PRIORITY ESTIMATION WITH MEMORY — identical to cosim_sumo: predecessor_gap
-            # proposes, RoleMemory (latch / queue arbiter / passer-compat arbiter / liveness)
-            # resolves the final roles and the kernel's pred_override ────────────
-            prop = utils.predecessor_gap(
-                ego_d, v_a, rival_d, rival_v, valid,
-                delta_safe=utils.DELTA_SAFE, ego_P=P,
-                rival_P=P.unsqueeze(0).expand(Na, Na))
-            ids = [int(k) for k in act.tolist()]                 # stable per-episode keys
-            pred_override, roles = role_mem.step(
-                ids, v_a, d_junc, in_box, behind_n, mv_a, ego_d, rival_d, valid,
-                prop, t)
-
-            ctx = mean_net.build_context(v_a, gap, v_lead, P, behind_n, d_junc,
-                                         ego_d, rival_d, valid, roles)
-            mean_fn = model.make_mean_fn(model.encode(*ctx))
-
-            # ── steps 1–3: conditional mean (gradient lives here) ──────────────
-            a_gp, yield_mask = utils.controller_acceleration(
-                torch.zeros(Na), gap + L_VEH, v_a, v_lead,
-                d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
-                ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
-                a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
-                return_roles=True, pred_override=pred_override, mean_fn=mean_fn)
-
-            # ── step 4: gate, straight-through (trajectory feels it, gradient skips it),
-            # with cosim's defer FEEDBACK (gate-deferred passer latched as yielder),
-            # force-rolled protected passers, and POST-GATE liveness — identical to cosim
-            force_roll = torch.tensor([roles[i] == 'pass'
-                                       and role_mem.protected(ids[i], t)
-                                       for i in range(Na)])
-            a_gate, defer = S.rollout_gate(a_gp.detach(), s_a, v_a, mv_a, yield_mask,
-                                           geo, s_junc, return_defer=True,
-                                           force_roll=force_roll)
-            role_mem.gate_feedback(ids, defer, t)
-            role_mem.ensure_passer(ids, roles, defer, in_box, d_junc, t)
-            a = a_gp + (a_gate - a_gp.detach()).detach()
-
-            # ── cosim's per-vehicle clamps (both differentiable):
-            # YIELDER never accelerates (except in the box — the gate is driving it out);
-            # PASSER keeps moving (V_MIN_PASS) with room ahead
-            yield_t = torch.tensor([roles[i] == 'yield' and not in_box[i]
-                                    for i in range(Na)])
-            a = torch.where(yield_t, a.clamp(max=0.0), a)
-
-            v_new = (v_a + a * DT).clamp(0.0, V_PHYS)
-            floor_t = torch.tensor([roles[i] == 'pass' and not bool(defer[i])
-                                    and float(gap[i]) > 2.0 * L_VEH for i in range(Na)])
-            v_new = torch.where(floor_t, v_new.clamp(min=C.V_MIN_PASS), v_new)
-            s_new = s_a + v_new * DT
-
-            # ── loss terms ──────────────────────────────────────────────────────
-            j_step = v_new.sum() * DT                           # ∫Σv dt, this step
-            hinge = torch.zeros(())
-            near = (d_junc.detach() > -S.JCT_PAST) & (d_junc.detach() < 60.0)
-            if int(near.sum()) >= 2:
-                ni = near.nonzero().flatten()
-                xy = torch.zeros(len(ni), 2)
-                for mi in range(4):
-                    selm = (mv_a[ni] == mi).nonzero().flatten()
-                    if len(selm):
-                        pts, cum = geo[C._MOVES[mi]]
-                        xy[selm], _ = S._interp(pts, cum, s_new[ni][selm] - L_VEH / 2.0)
-                cross = (ax_a[ni].unsqueeze(0) != ax_a[ni].unsqueeze(1))
-                cross = cross & torch.triu(torch.ones_like(cross), 1)
-                if bool(cross.any()):
-                    dist = (xy.unsqueeze(0) - xy.unsqueeze(1)).norm(dim=-1)
-                    hinge = (F_t.relu(D_HINGE - dist[cross]) ** 2).sum()
-            eff = (a_gp ** 2).mean()
-
-            # hinge enters as a TIME INTEGRAL (×DT) so its scale — and λ_s's sizing against
-            # the SUMO probe sweep, which also integrates — is independent of the sim step
-            loss_step = (-(j_step / (Ntot * plm))
-                         + LAM_S * hinge * DT / Ntot
-                         + LAM_C * eff / n_steps)
-            if not warm:
-                loss_win = loss_win + loss_step
-            loss_f  += float(loss_step)
-            j_sum_f += float(j_step); hinge_f += float(hinge) * DT
-            eff_f   += float(eff); eff_n += 1
-
-            # ── functional write-back ────────────────────────────────────────────
-            s = s.clone(); s[act] = s_new
-            v = v.clone(); v[act] = v_new
-            prev_a = prev_a.clone(); prev_a[act] = a
-
-        done = act[s[act] >= path_len[mv_a]]
-        state[done] = 2
-        arrived += len(done)
-
-        # ── truncated BPTT window: backward ACCUMULATES, no optimizer step here ─
-        if train and not warm and ((step + 1) % BPTT_K == 0 or step == n_steps - 1):
-            if loss_win.requires_grad:
-                loss_win.backward()
-            loss_win = torch.zeros(())
-            s, v, prev_a = s.detach(), v.detach(), prev_a.detach()
-
-    j_norm = j_sum_f / (Ntot * plm)
-    return loss_f, j_norm, hinge_f, eff_f / max(eff_n, 1), arrived
+    """Single-episode convenience wrapper over EpisodeStepper (used by the scratch
+    checks): advances window by window; if train, backward per window — gradients
+    ACCUMULATE, the caller owns averaging and the optimizer step.
+    Returns (loss_total, J_norm, hinge, effort, arrived) as floats."""
+    ep = EpisodeStepper(events, geo, s_cp, path_len, s_junc, jgeo)
+    while not ep.done():
+        loss_win, _, _ = ep.advance(model, train=train)
+        if train and loss_win.requires_grad:
+            loss_win.backward()
+        ep.detach()
+    return (ep.loss_f, ep.j_norm(), ep.hinge_f,
+            ep.eff_f / max(ep.eff_n, 1), ep.arrived)
 
 
 def main():
@@ -353,38 +396,52 @@ def main():
               + (" (fresh requested)" if fresh else f" ({CKPT} not found)"))
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
+    n_windows = int(T_END / WINDOW_S)
     print(f"\ntraining: {epochs} epochs × batch {batch} (pool {len(pool)} SUMO scenarios), "
-          f"lr={lr}, BPTT_K={BPTT_K}, λ_s={LAM_S}, λ_c={LAM_C}")
-    print("gradients are AVERAGED over each batch — one optimizer step per epoch\n")
+          f"lr={lr}, window={WINDOW_S:.0f}s, λ_s={LAM_S}, λ_c={LAM_C}")
+    print(f"one AVERAGED optimizer step per {WINDOW_S:.0f}s window, batched over the "
+          f"episodes — up to {n_windows} updates/epoch (warm-up windows skipped)\n")
 
-    for ep in range(epochs):
+    for ep_i in range(epochs):
         t0 = time.time()
         scenarios = random.sample(pool, min(batch, len(pool)))
-        opt.zero_grad()
-        ep_loss, ep_j, ep_hinge, ep_eff, ep_arr = 0.0, 0.0, 0.0, 0.0, 0
+        steppers = [EpisodeStepper(sc["events"], geo, s_cp, path_len, s_junc, jgeo)
+                    for sc in scenarios]
+        B = len(steppers)
+        n_upd = 0
 
-        for sc in scenarios:
-            t1 = time.time()
-            loss, j, hinge, eff, arr = rollout_episode(
-                model, sc["events"], geo, s_cp, path_len, s_junc, jgeo, train=True)
-            print(f"    [epoch {ep:3d}] loss evaluated  flow={sc['flow']} "
-                  f"seed={sc['seed']:2d}  loss={loss:+.4f}  J̄={j:.4f}  "
-                  f"hinge={hinge:7.2f}  ⟨a²⟩={eff:.3f}  arrived={arr}  "
-                  f"({time.time()-t1:.1f}s)")
-            ep_loss += loss; ep_j += j; ep_hinge += hinge; ep_eff += eff; ep_arr += arr
+        for w in range(n_windows):
+            tw = time.time()
+            opt.zero_grad()
+            w_loss, w_j, w_hinge, has_grad = 0.0, 0.0, 0.0, False
+            for st in steppers:
+                loss_win, wj, wh = st.advance(model)
+                if loss_win.requires_grad:
+                    loss_win.backward()
+                    has_grad = True
+                st.detach()
+                w_loss += float(loss_win); w_j += wj; w_hinge += wh
+            if not has_grad:
+                continue                       # all-warm-up window: nothing to step on
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad /= B
+            gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP))
+            opt.step(); n_upd += 1
+            print(f"    [epoch {ep_i:3d}] update {n_upd:2d}  t={w*WINDOW_S:3.0f}-"
+                  f"{(w+1)*WINDOW_S:3.0f}s  mean_win_loss={w_loss/B:+.4f}  "
+                  f"hinge={w_hinge/B:6.2f}  |grad|={gnorm:.3f}  ({time.time()-tw:.1f}s)")
 
-        # ── AVERAGE the accumulated gradients over the batch, then ONE step ─────
-        B = len(scenarios)
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad /= B
-        gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP))
-        opt.step()
-
+        ep_j, ep_hinge, ep_arr = 0.0, 0.0, 0
+        for sc, st in zip(scenarios, steppers):
+            j = st.j_norm()
+            print(f"    [epoch {ep_i:3d}] episode  flow={sc['flow']} "
+                  f"seed={sc['seed']:2d}  J̄={j:.4f}  hinge={st.hinge_f:7.2f}  "
+                  f"arrived={st.arrived}")
+            ep_j += j; ep_hinge += st.hinge_f; ep_arr += st.arrived
         ep_j /= B
-        print(f"  epoch {ep:3d}  mean_loss={ep_loss/B:+.4f}  mean_J̄={ep_j:.4f}  "
-              f"mean_hinge={ep_hinge/B:7.2f}  mean_⟨a²⟩={ep_eff/B:.3f}  "
-              f"arrived={ep_arr}  |grad|={gnorm:.3f}  ({time.time()-t0:.1f}s)\n")
+        print(f"  epoch {ep_i:3d}  mean_J̄={ep_j:.4f}  mean_hinge={ep_hinge/B:7.2f}  "
+              f"arrived={ep_arr}  updates={n_upd}  ({time.time()-t0:.1f}s)\n")
 
         # the checkpoint is always the BEST model (by epoch mean J̄, carried across runs)
         if ep_j > best_j:
