@@ -52,43 +52,81 @@ import torch.nn.functional as F
 
 # ── physical constants ─────────────────────────────────────────────────────────
 L_VEH    = 5.0     # m     vehicle length (bumper-to-bumper correction)
+W_VEH    = 1.8     # m     vehicle width
+CONFLICT_LEN = L_VEH + W_VEH   # m  longitudinal span a vehicle OCCUPIES the conflict point:
+                   #          its own length + the crossing vehicle's width.  Used to turn the
+                   #          point-ETA into an OCCUPANCY interval (front-in → rear-out) so the
+                   #          conflict gap reflects the 2-D footprints, not a dimensionless point.
 A_MAX    = 2.6     # m/s²  free-flow / accelerate target
 B_MAX    = 4.5     # m/s²  max comfortable deceleration (brake clamp magnitude)
 S0       = 2.0     # m     jam / standstill minimum gap
 T_HW     = 1.5     # s     desired time headway
-V0       = 13.89   # m/s   free / desired speed (open-road cap)
+V0       = 11.0    # m/s   free / desired speed (open-road cap)
 DELTA    = 4.0     # —     IDM free-flow exponent
 G_MAX    = 5.0     # —     soft clamp on the gap ratio g (open-road saturation)
-DELTA_SAFE = 4.0   # s     target conflict time-gap (bump τ_c up to here)
+DELTA_SAFE = 5.0   # s     target conflict time-gap (bump τ_c up to here)
+STOP_OFFSET = 6.0  # m     yield stop-line: halt this far BEFORE the conflict point (keep box clear)
+P_TIE      = 1.0   # m/s   platoon-pressure tie margin (|ΔP| within this = tie → ETA breaks it)
+TIE_EPS    = 1.5   # s     ETA band for the near-tie tiebreaker (slower vehicle yields)
 TAU_C_MAX  = 8.0   # s     soft clamp on τ_c (no-conflict saturation)
 EPS      = 1e-3    # numerical floor
 _SQRT_AB = math.sqrt(A_MAX * B_MAX)   # for the IDM closing term
 
 # ── kernel + anchor configuration ───────────────────────────────────────────────
-# ARD Matérn-1/2 length-scales, one per feature axis (g, τ_c).
-LENGTHSCALES = (1.0, 2.0)   # (ℓ_g in units of g, ℓ_τc in seconds)
+# ARD Matérn-1/2 length-scales, one per feature axis (g, τ_c, r).  ℓ_r is small so the
+# two ROLE columns (yield/pass) are nearly independent — role acts as a near-hard switch,
+# not a quantity to interpolate across.
+LENGTHSCALES = (1.0, 2.0, 0.3)   # (ℓ_g, ℓ_τc in s, ℓ_r)
 GP_JITTER    = 1e-6
 
-# 2-D anchor grid in (g, τ_c) space.  Targets are sentinels resolved per-state:
-#   'brake' → a_brake(state),  'free' → a_free(v),  'cross' → a_cross(state),  float → constant
-# Dense brake ladder at low g (0.25, 0.5) so the saturated a_brake anchor is not
-# diluted toward HOLD across g∈(0,1) — the regime where rear-end avoidance lives.
-_G_LEVELS    = (0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0)
-_TAUC_LEVELS = (0.0, DELTA_SAFE, TAU_C_MAX)
+# 3-D anchor grid in (g, τ_c, r) space.  r ∈ {0 = YIELDER, 1 = PASSER}.  Targets are
+# sentinels resolved per-state:
+#   'brake' → a_brake (≤0),  'free' → a_free(v),  'clear' → a_max (passer asserts),
+#   'yield' → a_cross clamped ≤0 (yielder brakes to the stop-line),  float → constant.
+# The role axis SIGN-GATES the consequent: the PASSER column may accelerate (free/clear),
+# the YIELDER column is ≤0 everywhere (brake/HOLD) — a yielder on a clear road HOLDS and
+# waits its turn instead of free-flowing.  Dense brake ladder at low g (0.25, 0.5) keeps
+# the saturated a_brake anchor from diluting toward HOLD across g∈(0,1).
+# Denser g ladder (0.75, 1.25, 1.5, 2.5) through the active car-following band → sharper
+# reactivity to the longitudinal gap; τ_c gains a ½·δ_safe level for finer cross timing.
+_G_LEVELS    = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
+def _tauc_levels(ds):
+    return (0.0, 0.5 * ds, ds, TAU_C_MAX)
+_TAUC_LEVELS = _tauc_levels(DELTA_SAFE)
+_ROLE_LEVELS = (0.0, 1.0)        # 0 = YIELDER, 1 = PASSER
 
-def _anchor_target(g: float, tc: float):
+def _anchor_target(g: float, tc: float, r: float):
     if g < 1.0:
-        return "brake"           # gap below desired → brake dominates at any conflict
+        return "brake"                          # longitudinal safety dominates for both roles
     if tc == 0.0:
-        return "cross"           # imminent cross conflict → yield/pass
+        return "clear" if r >= 0.5 else "yield" # passer asserts & clears; yielder brakes to line
     if g == 1.0:
-        return 0.0               # longitudinal HOLD at desired gap
-    # g ≥ 2: free-flow ONLY in the fully-clear column; the δ_safe column is a HOLD
-    # pin so the yield equilibrium settles AT δ_safe instead of diluting below it.
-    return "free" if tc >= TAU_C_MAX else 0.0
+        return 0.0                              # HOLD at desired gap
+    # g ≥ 2:
+    if tc >= TAU_C_MAX:
+        return "free" if r >= 0.5 else 0.0      # passer free-flows on clear road; yielder HOLDS
+    return 0.0                                  # δ_safe pin (both roles)
 
-ANCHOR_FEATS   = tuple((g, tc) for g in _G_LEVELS for tc in _TAUC_LEVELS)   # [M, 2]
-ANCHOR_TARGETS = tuple(_anchor_target(g, tc) for g, tc in ANCHOR_FEATS)     # [M]
+ANCHOR_FEATS   = tuple((g, tc, r) for g in _G_LEVELS for tc in _TAUC_LEVELS for r in _ROLE_LEVELS)
+ANCHOR_TARGETS = tuple(_anchor_target(g, tc, r) for g, tc, r in ANCHOR_FEATS)   # [M]
+
+
+def set_delta_safe(value):
+    """Override the target conflict time-gap δ_safe at RUNTIME (e.g. from a CLI) and
+    rebuild every structure derived from it: the middle τ_c anchor level, the anchor
+    feature grid (its position moves with δ_safe), and the cached GP inverse (whose Gram
+    matrix depends on the moved anchor — the _KINV_CACHE is keyed on shape, not position,
+    so it MUST be cleared).  controller_acceleration reads DELTA_SAFE at call time and
+    passes it on to free_flow_gate / cross_resolve_accel / resolve_cross_accel, so this
+    one call retargets the whole conflict-resolution stack.  Call it ONCE at startup
+    before the first controller_acceleration; δ_safe is expected in (0, TAU_C_MAX)."""
+    global DELTA_SAFE, _TAUC_LEVELS, ANCHOR_FEATS, ANCHOR_TARGETS
+    DELTA_SAFE     = float(value)
+    _TAUC_LEVELS   = _tauc_levels(DELTA_SAFE)
+    ANCHOR_FEATS   = tuple((g, tc, r) for g in _G_LEVELS for tc in _TAUC_LEVELS for r in _ROLE_LEVELS)
+    ANCHOR_TARGETS = tuple(_anchor_target(g, tc, r) for g, tc, r in ANCHOR_FEATS)
+    _KINV_CACHE.clear()
+    return DELTA_SAFE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,7 +226,7 @@ def free_flow_gate(tau_c, delta_safe=DELTA_SAFE):
 
 
 def cross_resolve_accel(d_ego, v_ego, eta_rival, delta, delta_safe=DELTA_SAFE,
-                        a_max=A_MAX, b_max=B_MAX):
+                        a_max=A_MAX, b_max=B_MAX, stop_offset=STOP_OFFSET):
     """
     CROSS anchor target: kinematic acceleration that drives the conflict time-gap
     to ±δ_safe, by reaching a target speed at the conflict point.
@@ -197,16 +235,39 @@ def cross_resolve_accel(d_ego, v_ego, eta_rival, delta, delta_safe=DELTA_SAFE,
         δ < 0  → ego arrives first  → PASS : η_e* = η_rival − δ_safe  (speed up)
                  …pass only if feasible (η_rival > δ_safe); else fall back to YIELD
         v_e*    = d_ego / η_e*
-        a_cross = (v_e*² − v_e²) / (2 d_ego),   clamped [−b_max, a_max]
+        a_time  = (v_e*² − v_e²) / (2 d_ego)
 
-    The δ=0 sign flip is an accepted kink (the symmetric danger apex).  Because a
-    rival runs the same rule with δ_rival = −δ, the pair self-assigns yield/pass.
+    STOP-LINE GUARD (yield only): the timing target alone drives v→0 *at* the conflict
+    point, so a yielder that can't make δ_safe creeps in and stalls ON the crossing line
+    (observed failure mode — slow yielders parked in the box get hit by the crossing
+    stream).  We instead require the yielder to be able to HALT before the box: brake to
+    v=0 at d_ego − stop_offset.  The yield accel is the MORE restrictive of the two
+    (min), so it stops at the line and waits; once the predecessor clears it is no longer
+    a rival → free anchor releases it.  The guard is dropped once the ego is already
+    inside (d_ego ≤ stop_offset) so anything in the box clears rather than freezing.
+    Differentiable throughout.
+
+        a_cross = clamp(min(a_time, a_stop), −b_max, a_max)
     """
     d_eff    = d_ego.clamp(min=EPS)
     do_yield = (delta >= 0) | (eta_rival <= delta_safe)        # feasibility fallback
     eta_tgt  = torch.where(do_yield, eta_rival + delta_safe, eta_rival - delta_safe)
     v_tgt    = d_eff / eta_tgt.clamp(min=EPS)
-    a        = (v_tgt.pow(2) - v_ego.pow(2)) / (2.0 * d_eff)
+    a_time   = (v_tgt.pow(2) - v_ego.pow(2)) / (2.0 * d_eff)
+
+    # stop-line guard with a HOLD zone, so the yielder neither creeps onto the point
+    # nor freezes once already inside the box:
+    #   approach (d > stop_offset)   : brake toward the stop line
+    #   hold     (0 < d ≤ stop_offset): do not advance (a ≤ 0) — wait at the line
+    #   in box   (d ≤ 0)             : release → clear via the timing target
+    d_stop   = (d_ego - stop_offset).clamp(min=EPS)
+    a_stop   = -v_ego.pow(2) / (2.0 * d_stop)
+    approach = d_ego > stop_offset
+    hold     = (~approach) & (d_ego > 0.0)
+    a_yield  = torch.where(approach, torch.minimum(a_time, a_stop),
+               torch.where(hold,     torch.minimum(a_time, torch.zeros_like(a_time)),
+                                     a_time))
+    a = torch.where(do_yield, a_yield, a_time)
     return a.clamp(min=-b_max, max=a_max)
 
 
@@ -256,67 +317,89 @@ def resolve_cross_accel(ego_d, v_ego, rival_d, rival_v, rival_valid,
     return a_cross, must_yield
 
 
-# ── iterative safety correction ─────────────────────────────────────────────────
-SAFE_ITERS  = 5      # number of correction passes (±0.2 each → up to ±1.0 m/s²)
-SAFE_STEP   = 0.2    # m/s²  accel adjustment per pass
-SAFE_BUFFER = 0.5    # s     margin added to the footprint collision threshold
+# ── arrival-order (virtual single-file queue) cross feature ─────────────────────
 
-
-def _predicted_eta(d, v, a):
+def predecessor_gap(ego_d, v_ego, rival_d, rival_v, rival_valid,
+                    delta_safe=DELTA_SAFE, tie_eps=TIE_EPS, tau_c_max=TAU_C_MAX,
+                    ego_P=None, rival_P=None):
     """
-    Predicted ego ETA to its conflict point if it holds acceleration a.
-    Constant-accel kinematics: v_pt² = v² + 2·a·d → T = 2d/(v + v_pt).  If the ego
-    would STOP before reaching d (v_pt² ≤ 0) it never arrives → return a large ETA
-    (safe).  Differentiable (sqrt with clamp).
+    Merge all approaches into ONE virtual queue ordered by ETA to the junction, and
+    return ego's arrival-time gap to its immediate PREDECESSOR — the cross feature.
+
+    δ_k = η_{e,k} − η_k  (per-pair).  k is a predecessor of ego (ego must follow it)
+    iff it clearly arrives earlier (δ_k > tie_eps) OR a near-tie ego loses on the
+    slower-yields rule.  The immediate predecessor p* = argmin_{predecessors} δ_k
+    (smallest positive gap, gathered → differentiable).
+
+    Returns:
+        r_gap      = Δη to p*, soft-clamped at tau_c_max   (= tau_c_max ⇒ ego is FIRST)
+        eta_pred, ego_d_pred, v_pred = p*'s ETA / ego-distance-to-its-point / speed
+        has_pred   = bool, whether ego has a predecessor (else it leads → free-flow)
+
+    Maintaining Δη ≥ δ_safe behind p* cascades: consecutive δ_safe gaps ⇒ every pair is
+    ≥ δ_safe apart ⇒ no two at the junction together.  Ego FIRST ⇒ no predecessor ⇒
+    r_gap = tau_c_max ⇒ the free anchor fires ⇒ it accelerates to clear.
     """
-    d  = d.clamp(min=0.0)
-    v  = v.clamp(min=EPS)
-    v_pt_sq = v.pow(2) + 2.0 * a * d
-    v_pt    = torch.sqrt(v_pt_sq.clamp(min=0.0))
-    eta     = 2.0 * d / (v + v_pt).clamp(min=EPS)
-    return torch.where(v_pt_sq > EPS, eta, torch.full_like(eta, 1e3))
+    v_e    = v_ego.clamp(min=EPS)
+    ego_dk = (ego_d if ego_d.shape == rival_d.shape else ego_d.unsqueeze(-1)).expand_as(rival_d)
+    eta_e  = ego_dk / v_e.unsqueeze(-1)                        # [..., K] per-pair ego ETA
+    eta_k  = rival_d / rival_v.clamp(min=EPS)                  # [..., K]
+    delta  = eta_e - eta_k                                     # >0 ⇒ k arrives before ego
 
+    near = delta.abs() <= tie_eps
+    if ego_P is not None and rival_P is not None:
+        # platoon-pressure priority: the busier/faster lane has right-of-way; ties broken
+        # by ETA (later arrival yields).  Pressure is available far out and changes slowly,
+        # so the sparse lane commits to yield EARLY (reaching its stop-line with room) and
+        # the decision doesn't flicker step-to-step (less chatter).  The third clause yields
+        # to a much-busier lane even when ego is marginally earlier — the early commitment.
+        dP      = rival_P - ego_P.unsqueeze(-1)
+        busier  = dP > P_TIE
+        eqP     = dP.abs() <= P_TIE
+        base    = ((delta > tie_eps)
+                   | (near & (busier | (eqP & (delta > 0.0))))
+                   | (busier & (delta > -tie_eps)))
+    else:
+        base    = (delta > tie_eps) | (near & (v_e.unsqueeze(-1) < rival_v))
 
-def iterative_safety_correction(a, v_ego, ego_d, eta_rival, v_rival, delta_worst,
-                                must_yield, any_rival, g, step=SAFE_STEP,
-                                n_iter=SAFE_ITERS, buffer=SAFE_BUFFER, a_max=A_MAX):
-    """
-    f_{i+1} = f_i + h(f_i).  At each pass a vehicle nudges its acceleration by ±`step`
-    in the SAFE direction for its role, re-reading the corrected accel each time:
+    # POINT OF NO RETURN: a vehicle within its braking distance (+ stop-line margin) of the
+    # conflict point can no longer stop → it is COMMITTED to proceed, and priority must NOT
+    # flip onto it.  So ego YIELDS to any committed rival (forced_yield), and ego itself never
+    # yields once committed (forced_proceed) — overriding the pressure/ETA base rule.  This
+    # removes the late-flip-then-emergency-brake failure: by the time a car can't stop, the
+    # other side gives way instead.
+    d_need_e = v_e.unsqueeze(-1).pow(2) / (2.0 * B_MAX)
+    d_need_r = rival_v.pow(2) / (2.0 * B_MAX)
+    ego_commit     = ego_dk  <= d_need_e + STOP_OFFSET
+    rival_commit   = rival_d <= d_need_r + STOP_OFFSET
+    forced_yield   = rival_commit & (~ego_commit)
+    forced_proceed = ego_commit & (~rival_commit)
+    is_pred = rival_valid & (forced_yield | (base & ~forced_proceed))
+    BIG     = 1e9
+    delta_m = torch.where(is_pred, delta, torch.full_like(delta, BIG))
+    r_raw, idx = delta_m.min(dim=-1)                          # immediate predecessor
+    has_pred   = is_pred.any(dim=-1)
 
-      YIELDER (δ_worst > 0, arrives later):  brake −step IF the predicted footprint gap
-        to the worst rival is still unsafe.  Braking → arrives later → gap grows.
+    idx_u      = idx.unsqueeze(-1)
+    eta_pred   = torch.gather(eta_k,   -1, idx_u).squeeze(-1)   # predecessor FRONT-in time
+    ego_d_pred = torch.gather(ego_dk,  -1, idx_u).squeeze(-1)
+    v_pred     = torch.gather(rival_v, -1, idx_u).squeeze(-1)
 
-      PASSER  (must_yield == False, earliest of ALL rivals):  accelerate +step IF it
-        stays safe — predicted gap after +step still ≥ threshold, accel ≤ a_max, and
-        longitudinal room (g ≥ 1, else it could rear-end its leader).  Accelerating →
-        arrives earlier → gap grows AND it clears the box sooner.
+    # 2-D / EXTREME-aware gap.  The predecessor doesn't clear the conflict point instantly —
+    # it OCCUPIES it for t_block = CONFLICT_LEN / v_pred (its body + the crosser's width).  The
+    # MOST DANGEROUS extreme for the yielder is its own FRONT entering vs the predecessor's
+    # REAR leaving, so the true safe gap is r_raw − t_block (front-in minus rear-out), and the
+    # yield target becomes "arrive δ_safe after the predecessor's rear clears" — eta_pred is
+    # shifted to that rear-out time so cross_resolve_accel (η_tgt = η_pred + δ_safe) stays
+    # consistent.  r_raw < t_block ⇒ footprints would overlap ⇒ r_gap clamps to 0 (hard yield).
+    t_block    = CONFLICT_LEN / v_pred.clamp(min=EPS)
+    eta_pred   = eta_pred + t_block                            # predecessor REAR-out time
+    r_raw      = r_raw - t_block                               # ego front-in − predecessor rear-out
 
-    Footprint threshold = (L/2)/v_e + (L/2)/v_k + buffer (speed-dependent crash
-    predictor).  The passer gate is must_yield (earliest of EVERYONE), NOT δ_worst<0:
-    a vehicle earlier than its closest rival can still be later than a farther one, and
-    accelerating would then cut in front of the rival it owed a yield to.
-    """
-    half = L_VEH / 2.0
-    thr  = half / v_ego.clamp(min=EPS) + half / v_rival.clamp(min=EPS) + buffer
-    is_yield = any_rival & (delta_worst > 0.0)                 # brake candidates
-    is_pass  = any_rival & (~must_yield) & (g >= 1.0)          # accel candidates (earliest + room)
-
-    a_corr = a
-    for _ in range(n_iter):
-        # YIELDER: brake more while still predicted-unsafe
-        eta_e    = _predicted_eta(ego_d, v_ego, a_corr)
-        unsafe   = is_yield & ((eta_e - eta_rival).abs() < thr)
-        a_brake  = torch.where(unsafe, a_corr - step, a_corr)
-
-        # PASSER: accelerate if +step keeps it safe and within limits
-        a_try    = a_corr + step
-        eta_e_up = _predicted_eta(ego_d, v_ego, a_try)
-        accel_ok = is_pass & ((eta_e_up - eta_rival).abs() >= thr) & (a_try <= a_max)
-        a_accel  = torch.where(accel_ok, a_try, a_corr)
-
-        a_corr   = torch.where(is_yield, a_brake, a_accel)     # roles are mutually exclusive
-    return a_corr
+    r_gap = torch.where(has_pred, r_raw.clamp(min=0.0),
+                        torch.full_like(r_raw, tau_c_max))
+    r_gap = tau_c_max - F.softplus(tau_c_max - r_gap)         # soft clamp (same as τ_c)
+    return r_gap, eta_pred, ego_d_pred, v_pred, has_pred, is_pred
 
 
 # ── differentiable safety floor ─────────────────────────────────────────────────
@@ -362,6 +445,25 @@ def _kernel_vec(feat, anchors, ls):
     return torch.exp(-(diff.abs() / ls).sum(-1))
 
 
+_KINV_CACHE: dict = {}   # (M, ls, dtype, device) → K⁻¹; anchors are fixed constants
+
+
+def _anchor_kinv(anchors, ls, jitter=GP_JITTER):
+    """K⁻¹ for the (fixed) anchor Gram, memoized so the inverse is computed once,
+    not per call.  Keyed on (M, ls, dtype, device) — valid because anchor positions
+    never change at runtime (they're module constants; not learned).  If anchors are
+    ever made learnable, drop this cache (it severs the gradient w.r.t. anchors)."""
+    key = (anchors.shape[0], tuple(ls.tolist()), anchors.dtype, str(anchors.device))
+    K_inv = _KINV_CACHE.get(key)
+    if K_inv is None:
+        M = anchors.shape[0]
+        K = _kernel_gram(anchors, ls) + jitter * torch.eye(
+            M, dtype=anchors.dtype, device=anchors.device)
+        K_inv = torch.linalg.inv(K)
+        _KINV_CACHE[key] = K_inv
+    return K_inv
+
+
 def gp_posterior(feat, anchors, targets, ls, jitter=GP_JITTER):
     """
     Zero-mean ARD GP posterior mean:  â = k(φ)ᵀ K⁻¹ y.
@@ -371,10 +473,7 @@ def gp_posterior(feat, anchors, targets, ls, jitter=GP_JITTER):
     targets [..., M]   anchor targets (may be state-dependent)
     ls      [D]        per-axis length-scales
     """
-    M = anchors.shape[0]
-    K = _kernel_gram(anchors, ls) + jitter * torch.eye(M, dtype=anchors.dtype,
-                                                        device=anchors.device)
-    K_inv = torch.linalg.inv(K)
+    K_inv = _anchor_kinv(anchors, ls, jitter)                  # cached
     k_vec = _kernel_vec(feat, anchors, ls)                     # [..., M]
     weights = k_vec @ K_inv                                    # [..., M]
     return (weights * targets).sum(dim=-1)
@@ -388,10 +487,13 @@ def controller_acceleration(
     x_ego, x_lead, v_ego, v_lead,
     # cross-traffic (optional — omit for pure car-following)
     d_conf=None, rival_d=None, rival_v=None, rival_valid=None,
+    ego_pressure=None, rival_pressure=None,
     length=L_VEH,
     lengthscales=LENGTHSCALES,
     a_prev=None, kappa=1.0, brake_exempt=True,
-    brake_floor=True, safe_iter=True,
+    brake_floor=True, predecessor=True,
+    pred_override=None,
+    return_roles=False,
 ):
     """
     2-D gap-ratio + conflict-time kernel controller.
@@ -405,6 +507,13 @@ def controller_acceleration(
     for per-pair conflict points, or a [...] scalar for the centre approximation).
     When omitted, τ_c = TAU_C_MAX and the controller reduces to pure car-following.
 
+    pred_override (predecessor mode only): a precomputed
+    (τ_c, eta_pred, ego_d_pred, v_pred, has_pred, is_pred) tuple from the caller's
+    STATE-ESTIMATION step.  When given, the internal predecessor_gap proposal is skipped
+    and these resolved values are used instead — this is how the stateful priority memory
+    (role latch, 50 m assignment, stuck→pass, platoon priority) is injected: the role is
+    decided where states are estimated, and the kernel just consumes it.
+
     Angle-2 damping (optional): first-order lag a_cmd = a_prev + κ(â−a_prev),
     bypassed when braking harder than a_prev if brake_exempt.
     """
@@ -412,25 +521,49 @@ def controller_acceleration(
     a_brake = brake_to_recover(x_ego, x_lead, v_ego, v_lead, length)
     a_free  = free_flow_accel(v_ego)
 
+    is_pred = None   # per-pair yield mask (who ego must yield to), for return_roles
     if rival_d is None:
-        tau_c   = torch.full_like(g, TAU_C_MAX)
-        a_cross = torch.zeros_like(g)
+        tau_c    = torch.full_like(g, TAU_C_MAX)
+        a_cross  = torch.zeros_like(g)
+        any_cross = torch.zeros_like(g, dtype=torch.bool)
+        has_pred  = torch.zeros_like(g, dtype=torch.bool)   # no cross → PASSER (free)
+    elif predecessor:
+        # virtual single-file queue: cross feature = arrival gap to the predecessor;
+        # the cross anchor is yield-to-predecessor (no pass branch — leaders free-flow).
+        # If the caller resolved the role in its state step, consume that; else propose here.
+        if pred_override is not None:
+            tau_c, eta_pred, ego_d_pred, v_pred, has_pred, is_pred = pred_override
+        else:
+            tau_c, eta_pred, ego_d_pred, v_pred, has_pred, is_pred = predecessor_gap(
+                d_conf, v_ego, rival_d, rival_v, rival_valid,
+                delta_safe=DELTA_SAFE, ego_P=ego_pressure, rival_P=rival_pressure)
+        a_cross   = cross_resolve_accel(ego_d_pred, v_ego, eta_pred, tau_c,
+                                        delta_safe=DELTA_SAFE)
+        a_cross   = torch.where(has_pred, a_cross, torch.zeros_like(a_cross))
+        any_cross = rival_valid.any(dim=-1)
     else:
         tau_c, delta_w, eta_w, any_rival, ego_d_sel, v_rival_sel = conflict_time_gap(
             d_conf, v_ego, rival_d, rival_v, rival_valid)
-        # η-ordering: satisfy ALL active conflict points with one arrival slot
         a_cross, must_yield = resolve_cross_accel(
-            d_conf, v_ego, rival_d, rival_v, rival_valid)
+            d_conf, v_ego, rival_d, rival_v, rival_valid, delta_safe=DELTA_SAFE)
+        eta_pred, ego_d_pred, v_pred, has_pred, any_cross = (
+            eta_w, ego_d_sel, v_rival_sel, must_yield, any_rival)
 
-    # rival-gated free-flow consequent: collapses a_free → a_cross as a rival nears
-    rho        = free_flow_gate(tau_c)
-    a_free_eff = rho * a_free + (1.0 - rho) * a_cross
+    # ROLE feature r ∈ {0=YIELDER, 1=PASSER}, derived from the resolved yield decision.
+    # has_pred=True (yielding) → r=0 (brake/HOLD column); else → r=1 (free/clear column).
+    # cosim's queue/latch memory sets has_pred upstream, so the queue promotion (yield→pass)
+    # flips the whole role column here.
+    r_feat = torch.where(has_pred, torch.zeros_like(g), torch.ones_like(g))
 
-    feat = torch.stack([g, tau_c], dim=-1)                     # [..., 2]
+    feat = torch.stack([g, tau_c, r_feat], dim=-1)             # [..., 3]
     anchors = torch.tensor(ANCHOR_FEATS, dtype=feat.dtype, device=feat.device)
     ls = torch.tensor(lengthscales, dtype=feat.dtype, device=feat.device)
 
-    _resolve = {"brake": a_brake, "free": a_free_eff, "cross": a_cross}
+    # role-sign-gated consequents: PASSER may accelerate (free / clear=a_max); YIELDER is ≤0
+    # (a_yield = the cross/stop-line decel clamped non-positive — a yielder never accelerates).
+    a_clear = torch.full_like(a_brake, A_MAX)
+    a_yield = a_cross.clamp(max=0.0)
+    _resolve = {"brake": a_brake, "free": a_free, "clear": a_clear, "yield": a_yield}
     target_cols = [
         _resolve[s] if isinstance(s, str) else torch.full_like(a_brake, float(s))
         for s in ANCHOR_TARGETS
@@ -443,15 +576,12 @@ def controller_acceleration(
     if brake_floor:
         a_raw = brake_safety_floor(a_raw, a_brake, g)
 
-    # iterative safety correction: brake harder while the predicted conflict is unsafe
-    if safe_iter and rival_d is not None:
-        a_raw = iterative_safety_correction(
-            a_raw, v_ego, ego_d_sel, eta_w, v_rival_sel, delta_w,
-            must_yield, any_rival, g)
-
     if a_prev is None or kappa >= 1.0:
-        return a_raw
-    a_damped = a_prev + kappa * (a_raw - a_prev)
-    if brake_exempt:
-        return torch.where(a_raw < a_prev, a_raw, a_damped)
-    return a_damped
+        a_out = a_raw
+    else:
+        a_damped = a_prev + kappa * (a_raw - a_prev)
+        a_out = torch.where(a_raw < a_prev, a_raw, a_damped) if brake_exempt else a_damped
+
+    if return_roles:
+        return a_out, is_pred
+    return a_out
