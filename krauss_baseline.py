@@ -1,9 +1,9 @@
-"""Scratch: SUMO native Krauss baseline — SUMO fully in control (no override), same
+"""SUMO native Krauss baseline — SUMO fully in control (no override), same
 Poisson routes/net. Reports throughput, collisions, teleports.
 
 usage:
-    python _krauss_baseline.py [flow] [seed] [gui]   # ONE run on a seed (like cosim_sumo); gui→watch
-    python _krauss_baseline.py <flows,csv> <nseeds>  # sweep: avg over seeds 0..nseeds-1
+    python krauss_baseline.py [flow] [seed] [gui]   # ONE run on a seed (like cosim_sumo); gui→watch
+    python krauss_baseline.py <flows,csv> <nseeds>  # sweep: avg over seeds 0..nseeds-1
 """
 import os, sys, time
 import numpy as np
@@ -13,7 +13,8 @@ import cosim_sumo as C
 
 def run_krauss(flow, seed, gui=False):
     routes = os.path.join(C.HERE, f"_krauss_routes_{flow}.rou.xml")   # isolated filename
-    C.write_routes(flow, routes)                                     # same vType (Krauss) + Poisson
+    # native baseline keeps departSpeed="desired" (inserts at maxSpeed, Krauss semantics)
+    C.write_routes(flow, routes, depart_speed="desired")             # same vType (Krauss) + Poisson
     sumo = sumolib.checkBinary("sumo-gui" if gui else "sumo")
     cmd = [sumo,
            "-n", os.path.join(C.HERE, "intersection.net.xml"),

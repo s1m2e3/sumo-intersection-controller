@@ -34,7 +34,7 @@ CLEAR  = utils.L_VEH + 1.0           # rival "still in box" clearance past its c
 # ── priority-memory parameters ──────────────────────────────────────────────────
 ASSIGN_DIST = 100.0  # m   a vehicle is ASSIGNED a (yield/pass) role within this of the box —
                      #     far enough out to commit to a role early and react before the box
-ROLE_HOLD   = 3.0    # s   a once-assigned role is LATCHED (not re-decided) for this long
+ROLE_HOLD   = 0.25   # s   a once-assigned role is LATCHED (not re-decided) for this long
 STUCK_V     = 3.0    # m/s "low speed" threshold for accumulating in-junction stuck time
 STUCK_HOLD  = 3.0    # s   a yielder stuck (in-junction, < STUCK_V) longer than this → PASS
 V_MIN_PASS  = 0.5    # m/s a PASSER is kept moving (non-zero velocity) — it never freezes
@@ -43,8 +43,14 @@ V_MIN_PASS  = 0.5    # m/s a PASSER is kept moving (non-zero velocity) — it ne
 QUEUE_MIN_BEHIND = 3     #     ≥ this many vehicles tightly behind ⇒ a real standing queue
 QUEUE_SPAN       = 40.0  # m   window behind the front within which queued cars are counted
 QUEUE_WAIT       = 5.0   # s   a queue waiting longer than this earns a clearing window
+QUEUE_STARVE     = 10.0  # s   waited this long ⇒ open EVEN IF the cross box is occupied —
+                         #     the gate's box exclusivity still sequences physical entry,
+                         #     so this only shifts right-of-way, never safety (anti-starvation)
 QUEUE_CLEAR      = 5.0   # s   protected window: the promoted passers' role can't be re-estimated
+QUEUE_HEADWAY    = 1.5   # s   extra protection per queue position (k-th promoted gets
+                         #     QUEUE_CLEAR + k·this), so the whole block has time to cross
 QUEUE_N_PASS     = 4     #     how many front-of-queue vehicles are promoted to PASS together
+QUEUE_N_MAX      = 8     #     ceiling when the promotion count scales with a LONG queue
 ARBITER_GAP      = 2.0   # s   two passers whose bumper-aware occupancy windows come within this
                          #     of each other are INCOMPATIBLE → the later one is demoted to yielder
 
@@ -58,7 +64,12 @@ ORIGIN = {"east_in": (0, -1.0), "west_in": (0, +1.0),
           "north_in": (1, -1.0), "south_in": (1, +1.0)}
 
 
-def write_routes(flow, path):
+def write_routes(flow, path, depart_speed=None):
+    """depart_speed: insertion speed (m/s).  Default V_PHYS so SUMO inserts at the
+    controller's speed cap — no first-step 13.89→11 snap, and the torch training sim
+    (which spawns at ≤ V_PHYS) sees the same initial speeds.  Pass "desired" for the
+    native-Krauss baseline (inserts at maxSpeed)."""
+    ds = V_PHYS if depart_speed is None else depart_speed
     with open(path, "w") as f:
         f.write('<routes>\n'
                 '  <vType id="car" accel="2.6" decel="4.5" sigma="0" length="5" '
@@ -67,7 +78,7 @@ def write_routes(flow, path):
         for fid, frm, to in [("ew", "east_in", "west_out"), ("we", "west_in", "east_out"),
                              ("ns", "north_in", "south_out"), ("sn", "south_in", "north_out")]:
             f.write(f'  <flow id="{fid}" type="car" from="{frm}" to="{to}" begin="0" '
-                    f'end="120" period="exp({rate:.5f})" departLane="best" departSpeed="desired"/>\n')
+                    f'end="120" period="exp({rate:.5f})" departLane="best" departSpeed="{ds}"/>\n')
         f.write('</routes>\n')
 
 
@@ -84,7 +95,7 @@ def write_routes_explicit(events, path):
             f.write(f'  <route id="{rid}" edges="{frm} {to}"/>\n')
         for k, (t, mi) in enumerate(events):
             f.write(f'  <vehicle id="v{k}" type="car" route="{rids[mi]}" '
-                    f'depart="{t:.2f}" departLane="best" departSpeed="desired"/>\n')
+                    f'depart="{t:.2f}" departLane="best" departSpeed="{V_PHYS}"/>\n')
         f.write('</routes>\n')
 
 
@@ -153,7 +164,7 @@ def _cp_tensors(net_path):
 
 
 def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=None,
-        gate2d=True, role_hold=ROLE_HOLD):
+        gate2d=True, role_hold=ROLE_HOLD, mean_model=None, hinge_probe=False):
     routes   = routes_override or os.path.join(HERE, f"_cosim_routes_{flow}.rou.xml")
     net_path = os.path.join(HERE, "intersection.net.xml")
     if routes_override is None:
@@ -183,18 +194,19 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
     # 2D rollout gate: path polylines + the gate itself live in sim_torch
     # (lazy import to avoid the circular module load — sim_torch imports this module)
     import sim_torch as S
+    from role_memory import RoleMemory   # lazy too (role_memory imports this module)
     geo, _, _, s_junc = S.build_geometry(net_path)
 
     configured = set()
     move_of    = {}                       # vid -> movement index (cached once)
     prev_a     = {}                       # vid -> last applied accel (Angle-2 lag)
-    # ── priority MEMORY (stateful, carried across steps; see priority-estimation block) ──
-    role       = {}                       # vid -> 'yield' | 'pass' | 'none'  (latched)
-    role_exp   = {}                       # vid -> sim-time the latch holds until
-    stuck_time = {}                       # vid -> accumulated s in-junction at v < STUCK_V
-    queue_wait = {}                       # movement idx -> s its standing queue has waited
-    queue_until = {}                      # vid -> sim-time a queue-promoted PASS is protected to
+    # priority MEMORY (latch / stuck / queue / arbiter / liveness) — extracted to
+    # role_memory.RoleMemory so the TRAINING rollout uses the identical machinery
+    role_mem   = RoleMemory(dt=DT)
     collided, col_details, collision_steps = set(), [], 0
+    # hinge probe: the TRAINING hinge evaluated on REAL SUMO positions —
+    # Σ relu(D_SAFE_2D − d_ij)² over cross-axis pairs near the box (centres).
+    hinge_total, hinge_pairs = 0.0, {}      # (vi,vj) -> (min centre dist, t at min)
     track = set(track)
     track_log = {v: [] for v in track}
     arrived_series = []
@@ -269,153 +281,53 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
         ego_d   = torch.nan_to_num(ego_d,   nan=1e3)
         rival_d = torch.nan_to_num(rival_d, nan=-1e3)
 
+        # ── hinge probe (proxy diagnostics; SUMO position = FRONT centre → shift L/2 back)
+        if hinge_probe:
+            half = utils.L_VEH / 2.0
+            cx = xs - torch.where(axis == 0, sgn, torch.zeros_like(sgn)) * half
+            cy = ys - torch.where(axis == 1, sgn, torch.zeros_like(sgn)) * half
+            near = (d_junc > -S.JCT_PAST) & (d_junc < 60.0)
+            ni = near.nonzero().flatten()
+            if len(ni) >= 2:
+                dist = ((cx[ni].unsqueeze(0) - cx[ni].unsqueeze(1)) ** 2
+                        + (cy[ni].unsqueeze(0) - cy[ni].unsqueeze(1)) ** 2).sqrt()
+                cross = axis[ni].unsqueeze(0) != axis[ni].unsqueeze(1)
+                cross = cross & torch.triu(torch.ones_like(cross), 1)
+                hinge_total += float((torch.relu(S.D_SAFE_2D - dist[cross]) ** 2).sum()) * DT
+                for p, q in (cross & (dist < S.D_SAFE_2D)).nonzero().tolist():
+                    va, vb = vehs[int(ni[p])], vehs[int(ni[q])]
+                    key = (va, vb) if va < vb else (vb, va)
+                    d_ = float(dist[p, q])
+                    if key not in hinge_pairs or d_ < hinge_pairs[key][0]:
+                        hinge_pairs[key] = (d_, round(step * DT, 1))
+
         # ── PRIORITY ESTIMATION WITH MEMORY (done HERE, in the state step) ──────────────
-        # 1. predecessor_gap PROPOSES the instantaneous role (+ live predecessor target).
-        # 2. memory resolves the FINAL role per vehicle:
-        #      • assign a role only within ASSIGN_DIST of the box; farther out → free-flow
-        #      • LATCH it for ROLE_HOLD s (no step-to-step re-deciding)
-        #      • a passer keeps its latch while its platoon (behind_n) hasn't cleared
-        #      • a yielder stuck in-junction (< STUCK_V) > STUCK_HOLD s is forced to PASS
-        # 3. the resolved role overrides has_pred / is_pred and is fed to the kernel as
-        #    pred_override, so the kernel consumes the decision rather than re-deriving it.
+        # predecessor_gap PROPOSES the instantaneous role; role_memory.RoleMemory (the
+        # EXACT machinery that used to live inline here — latch, queue arbiter, passer
+        # compatibility arbiter, liveness) resolves the FINAL roles and pred_override.
+        # Extracted so the TRAINING rollout consumes the identical role dynamics.
         prop = utils.predecessor_gap(
             ego_d, vs, rival_d, rival_v, valid,
             delta_safe=utils.DELTA_SAFE, ego_P=P, rival_P=P.unsqueeze(0).expand(N, N))
-        tau_c, eta_pred, ego_d_pred, v_pred, has_pred, is_pred = prop
-        t_now   = step * DT
-        has_res = has_pred.clone()
-        is_res  = is_pred.clone()
-        tau_res = tau_c.clone()                                  # τ_c fed to the kernel per role
-
-        # ── QUEUE ARBITER: a standing queue (≥ QUEUE_MIN_BEHIND tightly behind a slow front)
-        # that has waited > QUEUE_WAIT s gets a clearing window — its front QUEUE_N_PASS
-        # vehicles are PROMOTED to PASS and PROTECTED (role frozen) for QUEUE_CLEAR s, which
-        # forces the crossing stream to yield until the block clears.  Only the longest-waiting
-        # lane is opened at a time (one stream crosses at once).
-        for mi in range(4):
-            lane = ((mv == mi) & (d_junc > 0.0)).nonzero().flatten()
-            if len(lane) == 0:
-                queue_wait[mi] = 0.0; continue
-            front = lane[torch.argsort(d_junc[lane])[0]]
-            fdj   = float(d_junc[front])
-            n_behind = int(((mv == mi) & (d_junc > fdj) & (d_junc < fdj + QUEUE_SPAN)).sum())
-            if n_behind >= QUEUE_MIN_BEHIND and float(vs[front]) < STUCK_V:
-                queue_wait[mi] = queue_wait.get(mi, 0.0) + DT
-            else:
-                queue_wait[mi] = 0.0
-        # don't open a lane whose CROSS axis already has a vehicle in the box — that would
-        # promote a passer straight into a committed crosser neither side can yield to.
-        occ_ax = {int(ax_t[int(mv[j])]) for j in range(N) if in_box_v[j]}
-        ready = [mi for mi in range(4)
-                 if queue_wait.get(mi, 0.0) > QUEUE_WAIT
-                 and not any(a != int(ax_t[mi]) for a in occ_ax)]
-        if ready:
-            mi = max(ready, key=lambda m: queue_wait[m])         # longest-waiting lane opens
-            lane = ((mv == mi) & (d_junc > 0.0)).nonzero().flatten()
-            front4 = lane[torch.argsort(d_junc[lane])[:QUEUE_N_PASS]]
-            for li in front4.tolist():
-                queue_until[vehs[li]] = t_now + QUEUE_CLEAR      # protected PASS window
-            queue_wait[mi] = 0.0                                 # window opened → reset its timer
-
-        roles_i = ['none'] * N                                   # resolved role per vehicle (for clamps)
-        for i, vco in enumerate(vehs):
-            dj, sp = float(d_junc[i]), float(vs[i])
-            # accumulate WAIT time for any slow vehicle near the box (queued at the line OR
-            # inside it), so a stuck BLOCK — not only an in-box car — earns a turn: once the
-            # front has waited > STUCK_HOLD it is promoted to PASS and the platoon follows.
-            if (in_box_v[i] or dj <= ASSIGN_DIST) and sp < STUCK_V:
-                stuck_time[vco] = stuck_time.get(vco, 0.0) + DT
-            else:
-                stuck_time[vco] = 0.0                            # moving or far → reset
-            if t_now < queue_until.get(vco, -1.0):
-                # PROTECTED queue passer — role frozen for the clearing window, no re-estimation
-                r = 'pass'; role[vco] = 'pass'
-            else:
-                r, exp = role.get(vco, 'none'), role_exp.get(vco, -1.0)
-                # passer holds its latch until its platoon behind has cleared
-                latched = (t_now < exp) or (r == 'pass' and behind_n[i] > 0)
-                if not latched:
-                    if dj <= ASSIGN_DIST:
-                        r = 'yield' if bool(has_pred[i]) else 'pass'
-                        role[vco], role_exp[vco] = r, t_now + role_hold
-                    else:
-                        r, role[vco] = 'none', 'none'
-                # stuck yielder → force PASS (decision-level deadlock break, works in no-gate)
-                if r == 'yield' and stuck_time.get(vco, 0.0) > STUCK_HOLD:
-                    r, role[vco], role_exp[vco], stuck_time[vco] = 'pass', 'pass', t_now + role_hold, 0.0
-            roles_i[i] = r
-            if r == 'yield':
-                has_res[i] = True                               # keep live predecessor target + τ_c
-            else:                                               # 'pass' or 'none' → not yielding
-                has_res[i] = False
-                is_res[i, :] = False                            # clears its row for the gate's role view
-                tau_res[i]  = utils.TAU_C_MAX                    # NO cross conflict → free-flow fires
-
-        # ── PASSER COMPATIBILITY ARBITER ────────────────────────────────────────────────
-        # Among tentative PASSERS, confirm earliest-ETA first; demote the later of any crossing
-        # pair whose bumper-aware occupancy windows come within ARBITER_GAP s → the confirmed
-        # passer set is mutually collision-free.  A demoted passer becomes a strict YIELDER,
-        # re-pointed to yield to the passer it lost to.  Queue-promoted passers are protected
-        # (confirmed first, never demoted).  Anti-oscillation: a vehicle only STAYS a passer if
-        # it's compatible, so it can't flip back into a conflict it just lost.
-        eta_pred = eta_pred.clone(); ego_d_pred = ego_d_pred.clone(); v_pred = v_pred.clone()
-        CL = utils.CONFLICT_LEN
-        committed_i = [bool(in_box_v[i]) or
-                       (float(d_junc[i]) <= float(vs[i]) ** 2 / (2 * utils.B_MAX) + utils.STOP_OFFSET)
-                       for i in range(N)]
-
-        def _conflict(p, q):
-            if not (bool(valid[p, q]) or bool(valid[q, p])):
-                return False
-            vp, vq = max(float(vs[p]), 0.1), max(float(vs[q]), 0.1)
-            dp, dq = float(ego_d[p, q]), float(rival_d[p, q])
-            pin, pout = dp / vp, (dp + CL) / vp                 # p occupies [pin, pout]
-            qin, qout = dq / vq, (dq + CL) / vq                 # q occupies [qin, qout]
-            return max(pin - qout, qin - pout) < ARBITER_GAP    # windows within the margin
-
-        def _demote(i, q):                                      # i yields to passer q
-            vq = max(float(vs[q]), 0.1)
-            roles_i[i] = 'yield'; role[vehs[i]] = 'yield'; role_exp[vehs[i]] = t_now + role_hold
-            has_res[i] = True
-            ego_d_pred[i] = ego_d[i, q]
-            eta_pred[i]   = (rival_d[i, q] + CL) / vq           # q's rear-out time (bumper-aware)
-            v_pred[i]     = vs[q]
-            tau_res[i]    = max(float(ego_d[i, q]) / max(float(vs[i]), 0.1)
-                                - float(eta_pred[i]), 0.0)
-            is_res[i, :] = False; is_res[i, q] = True
-
-        passers   = [i for i in range(N) if roles_i[i] == 'pass']
-        protected = [i for i in passers if t_now < queue_until.get(vehs[i], -1.0)]
-        rest = sorted((i for i in passers if i not in protected),
-                      key=lambda i: float(d_junc[i]) / max(float(vs[i]), 0.5))   # by ETA
-        confirmed = list(protected)
-        for p in rest:
-            q = next((c for c in confirmed if _conflict(p, c)), None)
-            if q is None:
-                confirmed.append(p)                            # compatible → stays PASSER
-            elif committed_i[p] and not committed_i[q] and q not in protected:
-                _demote(q, p); confirmed.remove(q); confirmed.append(p)   # p can't stop → q yields
-            else:
-                _demote(p, q)                                  # later/abletostop → p yields
-
-        # LIVENESS: the junction must always have ≥1 PASSER.  If every contesting vehicle ended
-        # up a yielder (a latch/arbiter deadlock — mutual yielding), nobody moves and the box
-        # never drains.  Promote the front-most contender (in-box first, else closest to the box)
-        # to PASS, overriding its latch, so the intersection always has someone clearing.
-        contesting = [i for i in range(N) if in_box_v[i] or 0.0 < float(d_junc[i]) <= ASSIGN_DIST]
-        # only force a passer when the junction is TRULY stalled: nobody passing, nobody
-        # committed (a committed crosser is the de-facto passer), nobody still moving.
-        alive = any(roles_i[i] == 'pass' or committed_i[i] or float(vs[i]) > STUCK_V
-                    for i in contesting)
-        if contesting and not alive:
-            best = min(contesting, key=lambda i: (0 if in_box_v[i] else 1, float(d_junc[i])))
-            roles_i[best] = 'pass'; role[vehs[best]] = 'pass'; role_exp[vehs[best]] = t_now + role_hold
-            has_res[best] = False; is_res[best, :] = False; tau_res[best] = utils.TAU_C_MAX
+        t_now = step * DT
+        pred_override, roles_i = role_mem.step(
+            vehs, vs, d_junc, in_box_v, behind_n, mv, ego_d, rival_d, valid,
+            prop, t_now, role_hold)
 
         if gui:
             for i, vco in enumerate(vehs):
                 traci.vehicle.setColor(vco, ROLE_COLOR[roles_i[i]])
-        pred_override = (tau_res, eta_pred, ego_d_pred, v_pred, has_res, is_res)
+
+        # ── transformer prior mean (optional): encode the conflict set + rear pressure
+        # ONCE per ego, hand the controller a mean_fn closure.  The GP correction pins
+        # the anchor targets exactly regardless of f; the gate below is untouched and
+        # consumes the conditional-mean output like any other command.
+        mean_fn = None
+        if mean_model is not None:
+            import mean_net
+            ctx = mean_net.build_context(vs, gap, v_lead, P, behind_n, d_junc,
+                                         ego_d, rival_d, valid, roles_i)
+            mean_fn = mean_model.make_mean_fn(mean_model.encode(*ctx))
 
         xe = torch.zeros(N)
         xl = gap + utils.L_VEH
@@ -424,25 +336,34 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
             d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
             ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(N, N),
             a_prev=a_prev_t, kappa=0.5, brake_exempt=True,
-            pred_override=pred_override, return_roles=gate2d)
+            pred_override=pred_override, return_roles=gate2d, mean_fn=mean_fn)
         if gate2d:
             a, yield_mask = out
+            # PROTECTED passers (queue- or liveness-promoted) are force-rolled so the
+            # gate always commits them and reserves their axis — crossing traffic
+            # plans around them instead of being blind to an undesignated passer.
+            force_roll = torch.tensor([roles_i[i] == 'pass'
+                                       and role_mem.protected(vehs[i], t_now)
+                                       for i in range(N)])
             a, defer = S.rollout_gate(a.detach(), s_front, vs, mv, yield_mask, geo, s_junc,
-                                      return_defer=True)
+                                      return_defer=True, force_roll=force_roll)
             # FEEDBACK: a passer the gate forced to brake (or a vehicle it halted at the
             # stop-line) is deferring → latch it as a yielder for role_hold s, so the gate's
             # tiebreak persists instead of being re-fought (and re-flipped) next step.
-            for i, vco in enumerate(vehs):
-                # protected queue passers are NOT re-labelled by the gate (their window holds)
-                if bool(defer[i]) and t_now >= queue_until.get(vco, -1.0):
-                    role[vco], role_exp[vco] = 'yield', t_now + role_hold
+            # (protected queue passers are NOT re-labelled — their window holds)
+            role_mem.gate_feedback(vehs, defer, t_now, role_hold)
+            # POST-GATE liveness: never end a step with zero effective passers — if the
+            # gate just neutralized the only one, promote (protected) for the next steps.
+            role_mem.ensure_passer(vehs, roles_i, defer, in_box_v, d_junc, t_now, role_hold)
         else:
             a = out.detach()        # raw kernel-interpolation anchors, no 2-D gate
 
         for i, v in enumerate(vehs):
             ai = float(a[i])
-            if roles_i[i] == 'yield':
-                ai = min(ai, 0.0)                                # YIELDER: no positive acceleration
+            # YIELDER: no positive acceleration — EXCEPT in the box, where the gate's
+            # deadlock breaker is driving it OUT (clamping there freezes it in the box)
+            if roles_i[i] == 'yield' and not in_box_v[i]:
+                ai = min(ai, 0.0)
             prev_a[v] = ai
             v_new = float(min(max(float(vs[i]) + ai * DT, 0.0), V_PHYS))
             # PASSER keeps moving (non-zero v) — but ONLY with room ahead, so the floor never
@@ -488,7 +409,9 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
     traci.close()
     return dict(flow=flow, seed=seed, arrived=total_arrived, ss_rate=ss_rate,
                 collided=len(collided), collision_steps=collision_steps,
-                col_details=col_details, track_log=track_log)
+                col_details=col_details, track_log=track_log,
+                hinge=hinge_total, hinge_pairs=hinge_pairs,
+                collided_ids=sorted(collided))
 
 
 if __name__ == "__main__":
@@ -507,15 +430,46 @@ if __name__ == "__main__":
     # period).  hold=0 → re-decide every step (the old stateless behavior).
     h_tok = next((t for t in tokens if t.startswith(("hold=", "reest="))), None)
     role_hold = float(h_tok.split("=", 1)[1]) if h_tok is not None else ROLE_HOLD
-    _kv = ("gui", "realtime", "nogate")
+    # transformer prior mean: by default load the BEST trained model (train_mean.py
+    # checkpoint) if one exists; otherwise fall back to the plain zero-mean kernel.
+    #   "nonn" → force the plain kernel even if a checkpoint exists
+    #   "nn"   → attach a FRESH zero-init model (f ≡ 0 ⇒ identical to the plain
+    #            kernel — kept as the integration check)
+    mean_model = None
+    if "nn" in tokens:
+        import mean_net
+        mean_model = mean_net.MeanTransformer()
+        mean_model.eval()
+        print("nn: fresh ZERO-INIT prior mean attached (must match the plain kernel)")
+    elif "nonn" not in tokens:
+        ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mean_net_ckpt.pt")
+        if os.path.exists(ckpt):
+            import mean_net
+            ck = torch.load(ckpt, weights_only=True)
+            sd, bj = ((ck["state_dict"], ck.get("best_j"))
+                      if isinstance(ck, dict) and "state_dict" in ck else (ck, None))
+            mean_model = mean_net.MeanTransformer()
+            mean_model.load_state_dict(sd)
+            mean_model.eval()
+            print(f"loaded best trained prior mean from {os.path.basename(ckpt)}"
+                  + (f" (mean J̄={bj:.4f})" if bj is not None else ""))
+        else:
+            print("no trained model found (mean_net_ckpt.pt) → plain kernel controller")
+    # "hinge" → also evaluate the training hinge on the real SUMO positions and report
+    # every cross pair that came inside D_SAFE_2D (proxy diagnostics vs real collisions)
+    hinge_probe = "hinge" in tokens
+    _kv = ("gui", "realtime", "nogate", "nn", "nonn", "hinge")
     args = [a for a in tokens
             if a not in _kv and not a.startswith(("dsafe=", "ds=", "hold=", "reest="))]
     flow = int(args[0]) if len(args) > 0 else 500
     seed = int(args[1]) if len(args) > 1 else 0
-    r = run(flow, seed, gui=gui, realtime=gui, gate2d=gate2d, role_hold=role_hold)
+    r = run(flow, seed, gui=gui, realtime=gui, gate2d=gate2d, role_hold=role_hold,
+            mean_model=mean_model, hinge_probe=hinge_probe)
     mode = "kernel+gate" if gate2d else "kernel-only (no gate)"
+    if mean_model is not None:
+        mode += " +nn-mean (zero-init)" if "nn" in tokens else " +nn-mean (best ckpt)"
     print(f"=== OUR controller co-simulated in SUMO (TraCI), {flow} vph/approach, seed {seed}"
-          f"  [{mode}, δ_safe={utils.DELTA_SAFE:.1f}s, re-est={role_hold:.1f}s] ===")
+          f"  [{mode}, δ_safe={utils.DELTA_SAFE:.1f}s, re-est={role_hold:.2f}s] ===")
     print(f"  arrived (cleared, 120s)        : {r['arrived']}")
     print(f"  steady-state throughput        : {r['ss_rate']:.0f} veh/h")
     print(f"  vehicles in a SUMO collision   : {r['collided']}")
@@ -525,3 +479,10 @@ if __name__ == "__main__":
         for d in r["col_details"]:
             print(f"    t={d[0]:5.1f} {d[1]:>10} road={d[2]:>10} {d[3]:>8} axis={d[4]} "
                   f"pos=({d[5]:6.1f},{d[6]:6.1f}) v={d[7]:.2f}")
+    if hinge_probe:
+        hp = sorted(r["hinge_pairs"].items(), key=lambda kv: kv[1][0])
+        print(f"  hinge integral relu(6.5-d)^2   : {r['hinge']:.2f}"
+              f"   cross pairs inside 6.5 m: {len(hp)}")
+        for (va, vb), (dmin, tmin) in hp[:12]:
+            mark = "  <- COLLIDED" if va in r["collided_ids"] and vb in r["collided_ids"] else ""
+            print(f"    {va:>6} x {vb:<6} min_d={dmin:5.2f} m at t={tmin:6.1f}{mark}")

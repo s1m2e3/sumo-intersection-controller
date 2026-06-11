@@ -155,7 +155,7 @@ JCT_AHEAD = 30.0  # m before the junction entry: vehicles within this band are A
 
 
 def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_defer=False,
-                 delta_safe=None):
+                 delta_safe=None, force_roll=None):
     """
     Final 2-D safety gate on the kernel command `a`.  SYMMETRIC: it both brakes
     yielders away from danger AND lets priority vehicles accelerate to clear, in each
@@ -192,6 +192,14 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
     it had to brake against a committed crosser, or a vehicle halted by box-exclusivity.
     The caller (cosim memory) re-labels these as 'yield' and holds their re-estimation
     latch, so the gate's tiebreak persists instead of being re-fought every step.
+
+    force_roll: optional [N] bool — PROTECTED passers (queue- or liveness-promoted)
+    that must ALWAYS be processed even if nobody designates them in yield_mask.
+    Without this, a promoted passer no one yields to is skipped entirely: it never
+    enters the committed list, never reserves its axis, and crossing traffic plans
+    around it blind.  Forced vehicles are treated as leaders (rolled, committed,
+    axis-reserving) but are NOT accelerated past a braking kernel command (a < 0
+    means an in-lane constraint the cross rollout can't see).
     """
     defer = torch.zeros(len(s), dtype=torch.bool)
     # δ_safe widens the gate's safety distance (only ever more conservative than the floor)
@@ -220,7 +228,9 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
     in_box   = (d_to_junc < 0.0) & in_jct
     yielders = is_yield & in_jct & (~in_box)
     leaders  = ((is_lead & (a >= 0.0)) | in_box) & in_jct
-    roll = (yielders | leaders)
+    forced   = (force_roll & in_jct & (~yielders)) if force_roll is not None \
+               else torch.zeros(len(s), dtype=torch.bool)
+    roll = (yielders | leaders | forced)
     if verbose:
         print(f"    gate: active={len(s)} in_junction={int(in_jct.sum())} "
               f"in_box={int(in_box.sum())} yielders={int(yielders.sum())} "
@@ -291,7 +301,10 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
                     com_braked = com_braked or unsafe_com
                 else:
                     break
-            elif (not is_y) and ai < utils.A_MAX:               # clear of all → speed it up to clear
+            elif ((not is_y) and ai < utils.A_MAX
+                  and not (bool(forced[i]) and float(a[i]) < 0.0)):
+                # clear of all → speed it up to clear; EXCEPT a forced passer whose
+                # kernel command is braking (in-lane constraint the rollout can't see)
                 ai = min(ai + GATE_STEP, utils.A_MAX)
             else:
                 break
@@ -347,7 +360,7 @@ def gen_events(flow, seed):
 
 
 def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
-             events=None, gate2d=True, dt=DT, verbose=False):
+             events=None, gate2d=True, dt=DT, verbose=False, mean_model=None):
     DT_ = dt
     if geo is None:
         geo, s_cp, path_len, s_junc = build_geometry()
@@ -422,12 +435,31 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
         appr = s_a < s_junc[mv_a]
         P = ((same & appr.unsqueeze(0)).float() * v_a.unsqueeze(0)).sum(dim=1)
 
+        # transformer prior mean (optional): resolve roles in the state step (same
+        # predecessor_gap call the controller would make — fed back as pred_override,
+        # so behavior is IDENTICAL), build the context, hand over a mean_fn closure.
+        mean_fn, pred_override = None, None
+        if mean_model is not None:
+            import mean_net
+            prop = utils.predecessor_gap(
+                ego_d, v_a, rival_d, rival_v, valid,
+                delta_safe=utils.DELTA_SAFE, ego_P=P,
+                rival_P=P.unsqueeze(0).expand(Na, Na))
+            pred_override = prop
+            roles = ["yield" if bool(h) else "pass" for h in prop[4]]
+            behind_n = (same & appr.unsqueeze(0)
+                        & (s_a.unsqueeze(0) < s_a.unsqueeze(1))).float().sum(dim=1)
+            d_junc = s_junc[mv_a] - s_a
+            ctx = mean_net.build_context(v_a, gap, v_lead, P, behind_n, d_junc,
+                                         ego_d, rival_d, valid, roles)
+            mean_fn = mean_model.make_mean_fn(mean_model.encode(*ctx))
+
         out = utils.controller_acceleration(
             torch.zeros(Na), gap + L_VEH, v_a, v_lead,
             d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
             ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
             a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
-            return_roles=gate2d)
+            return_roles=gate2d, pred_override=pred_override, mean_fn=mean_fn)
         if gate2d:
             a, yield_mask = out
             if verbose and step % 20 == 0:

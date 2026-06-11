@@ -464,19 +464,35 @@ def _anchor_kinv(anchors, ls, jitter=GP_JITTER):
     return K_inv
 
 
-def gp_posterior(feat, anchors, targets, ls, jitter=GP_JITTER):
+def gp_posterior(feat, anchors, targets, ls, jitter=GP_JITTER,
+                 mean_q=None, mean_X=None):
     """
-    Zero-mean ARD GP posterior mean:  â = k(φ)ᵀ K⁻¹ y.
+    ARD GP posterior mean.  Zero prior mean (default):
+
+        â = k(φ)ᵀ K⁻¹ y
+
+    With a prior mean function m(·) (the conditional Gaussian mean formula),
+    pass its evaluations at the query (mean_q) and at the anchors (mean_X):
+
+        â = m(φ) + k(φ)ᵀ K⁻¹ (y − m(X))
+
+    Exact at anchors REGARDLESS of m (k(xᵢ)ᵀK⁻¹ is the i-th unit row, so the
+    correction cancels m(xᵢ) and returns yᵢ); far from all anchors k → 0 and
+    the posterior reverts to the prior mean m(φ) (0 in the default case).
 
     feat    [..., D]   query feature vectors
     anchors [M, D]     anchor positions
     targets [..., M]   anchor targets (may be state-dependent)
     ls      [D]        per-axis length-scales
+    mean_q  [...]      prior mean at the query   (optional, with mean_X)
+    mean_X  [..., M]   prior mean at the anchors (optional, with mean_q)
     """
     K_inv = _anchor_kinv(anchors, ls, jitter)                  # cached
     k_vec = _kernel_vec(feat, anchors, ls)                     # [..., M]
     weights = k_vec @ K_inv                                    # [..., M]
-    return (weights * targets).sum(dim=-1)
+    if mean_q is None:
+        return (weights * targets).sum(dim=-1)
+    return mean_q + (weights * (targets - mean_X)).sum(dim=-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -494,6 +510,7 @@ def controller_acceleration(
     brake_floor=True, predecessor=True,
     pred_override=None,
     return_roles=False,
+    mean_fn=None,
 ):
     """
     2-D gap-ratio + conflict-time kernel controller.
@@ -516,6 +533,17 @@ def controller_acceleration(
 
     Angle-2 damping (optional): first-order lag a_cmd = a_prev + κ(â−a_prev),
     bypassed when braking harder than a_prev if brake_exempt.
+
+    mean_fn (optional): a prior MEAN function f(φ) → accel (e.g. the closure from
+    mean_net.MeanTransformer.make_mean_fn, with the traffic context baked in).
+    The posterior becomes the conditional Gaussian mean
+
+        â = f(φ*) + k(φ*)ᵀ K⁻¹ (y − f(X))
+
+    i.e. anchors pin the physics targets exactly (per-context, regardless of f)
+    and the learned mean takes over away from them.  mean_fn must accept φ of
+    shape [..., M+1, 3] (query stacked with the M anchors) and return [..., M+1].
+    None ⇒ zero prior mean, byte-identical to the original controller.
     """
     g       = gap_ratio(x_ego, x_lead, v_ego, v_lead, length)
     a_brake = brake_to_recover(x_ego, x_lead, v_ego, v_lead, length)
@@ -570,7 +598,17 @@ def controller_acceleration(
     ]
     targets = torch.stack(target_cols, dim=-1)                 # [..., M]
 
-    a_raw = gp_posterior(feat, anchors, targets, ls)
+    if mean_fn is None:
+        a_raw = gp_posterior(feat, anchors, targets, ls)
+    else:
+        # conditional mean with the learned prior: ONE batched mean_fn call over
+        # the query + the M anchor counterfactuals (context held fixed)
+        M = anchors.shape[0]
+        anc = anchors.expand(*feat.shape[:-1], M, anchors.shape[-1])
+        phi_all = torch.cat([feat.unsqueeze(-2), anc], dim=-2)     # [..., M+1, 3]
+        f_all = mean_fn(phi_all)                                   # [..., M+1]
+        a_raw = gp_posterior(feat, anchors, targets, ls,
+                             mean_q=f_all[..., 0], mean_X=f_all[..., 1:])
 
     # differentiable safety floor: never weaker than the saturated brake when g<1
     if brake_floor:
