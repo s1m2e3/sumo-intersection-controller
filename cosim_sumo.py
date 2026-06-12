@@ -34,7 +34,7 @@ CLEAR  = utils.L_VEH + 1.0           # rival "still in box" clearance past its c
 # ── priority-memory parameters ──────────────────────────────────────────────────
 ASSIGN_DIST = 100.0  # m   a vehicle is ASSIGNED a (yield/pass) role within this of the box —
                      #     far enough out to commit to a role early and react before the box
-ROLE_HOLD   = 0.25   # s   a once-assigned role is LATCHED (not re-decided) for this long
+ROLE_HOLD   = 0.2    # s   a once-assigned role is LATCHED (not re-decided) for this long
 STUCK_V     = 3.0    # m/s "low speed" threshold for accumulating in-junction stuck time
 STUCK_HOLD  = 3.0    # s   a yielder stuck (in-junction, < STUCK_V) longer than this → PASS
 V_MIN_PASS  = 0.5    # m/s a PASSER is kept moving (non-zero velocity) — it never freezes
@@ -164,7 +164,8 @@ def _cp_tensors(net_path):
 
 
 def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=None,
-        gate2d=True, role_hold=ROLE_HOLD, mean_model=None, hinge_probe=False):
+        gate2d=True, role_hold=ROLE_HOLD, mean_model=None, hinge_probe=False,
+        hinge_gate=False):
     routes   = routes_override or os.path.join(HERE, f"_cosim_routes_{flow}.rou.xml")
     net_path = os.path.join(HERE, "intersection.net.xml")
     if routes_override is None:
@@ -210,6 +211,7 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
     track = set(track)
     track_log = {v: [] for v in track}
     arrived_series = []
+    speed_sum, speed_cnt = 0.0, 0          # network-mean speed over all vehicle-steps
     n_steps = int(T_END / DT)
 
     for step in range(n_steps):
@@ -235,6 +237,7 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
         xs = torch.tensor([sub[v][tc.VAR_POSITION][0] for v in vehs])
         ys = torch.tensor([sub[v][tc.VAR_POSITION][1] for v in vehs])
         vs = torch.tensor([sub[v][tc.VAR_SPEED]       for v in vehs])
+        speed_sum += float(vs.sum()); speed_cnt += N
         # front arc-length along the path (validated: getDistance + L, departPos="base")
         s_front = torch.tensor([sub[v][tc.VAR_DISTANCE] for v in vehs]) + utils.L_VEH
         mv = torch.tensor([move_of[v]                 for v in vehs])
@@ -336,9 +339,10 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
             d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
             ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(N, N),
             a_prev=a_prev_t, kappa=0.5, brake_exempt=True,
-            pred_override=pred_override, return_roles=gate2d, mean_fn=mean_fn)
+            pred_override=pred_override, return_roles=gate2d,
+            return_feat=(gate2d and hinge_gate), mean_fn=mean_fn)
         if gate2d:
-            a, yield_mask = out
+            a, yield_mask, feat = out if hinge_gate else (*out, None)
             # PROTECTED passers (queue- or liveness-promoted) are force-rolled so the
             # gate always commits them and reserves their axis — crossing traffic
             # plans around them instead of being blind to an undesignated passer.
@@ -347,6 +351,13 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
                                        for i in range(N)])
             a, defer = S.rollout_gate(a.detach(), s_front, vs, mv, yield_mask, geo, s_junc,
                                       return_defer=True, force_roll=force_roll)
+            # FGD polish: L2 functional-gradient descent on the 2-D hinge, AFTER the
+            # role gate (box-exclusivity intact).  Can brake past the gate's −3 comfort
+            # floor toward −B_MAX when a conflict is imminent — the extra authority the
+            # discrete gate lacks.  Runs in the real SUMO loop so it is validated here.
+            if hinge_gate:
+                a = S.hinge_gradient_gate(a.detach(), feat.detach(),
+                                          s_front, vs, mv, geo, s_junc).detach()
             # FEEDBACK: a passer the gate forced to brake (or a vehicle it halted at the
             # stop-line) is deferring → latch it as a yielder for role_hold s, so the gate's
             # tiebreak persists instead of being re-fought (and re-flipped) next step.
@@ -408,6 +419,7 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
     ss_rate = np.sum(arrived_series[i40:]) / ((n_steps - i40) * DT) * 3600
     traci.close()
     return dict(flow=flow, seed=seed, arrived=total_arrived, ss_rate=ss_rate,
+                avg_speed=speed_sum / max(speed_cnt, 1),
                 collided=len(collided), collision_steps=collision_steps,
                 col_details=col_details, track_log=track_log,
                 hinge=hinge_total, hinge_pairs=hinge_pairs,
@@ -458,14 +470,15 @@ if __name__ == "__main__":
     # "hinge" → also evaluate the training hinge on the real SUMO positions and report
     # every cross pair that came inside D_SAFE_2D (proxy diagnostics vs real collisions)
     hinge_probe = "hinge" in tokens
-    _kv = ("gui", "realtime", "nogate", "nn", "nonn", "hinge")
+    hinge_gate  = "fgd" in tokens          # FGD polish: L2 hinge-gradient correction
+    _kv = ("gui", "realtime", "nogate", "nn", "nonn", "hinge", "fgd")
     args = [a for a in tokens
             if a not in _kv and not a.startswith(("dsafe=", "ds=", "hold=", "reest="))]
     flow = int(args[0]) if len(args) > 0 else 500
     seed = int(args[1]) if len(args) > 1 else 0
     r = run(flow, seed, gui=gui, realtime=gui, gate2d=gate2d, role_hold=role_hold,
-            mean_model=mean_model, hinge_probe=hinge_probe)
-    mode = "kernel+gate" if gate2d else "kernel-only (no gate)"
+            mean_model=mean_model, hinge_probe=hinge_probe, hinge_gate=hinge_gate)
+    mode = ("kernel+gate" if gate2d else "kernel-only (no gate)") + (" +FGD" if hinge_gate else "")
     if mean_model is not None:
         mode += " +nn-mean (zero-init)" if "nn" in tokens else " +nn-mean (best ckpt)"
     print(f"=== OUR controller co-simulated in SUMO (TraCI), {flow} vph/approach, seed {seed}"

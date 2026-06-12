@@ -64,7 +64,7 @@ T_HW     = 1.5     # s     desired time headway
 V0       = 11.0    # m/s   free / desired speed (open-road cap)
 DELTA    = 4.0     # —     IDM free-flow exponent
 G_MAX    = 5.0     # —     soft clamp on the gap ratio g (open-road saturation)
-DELTA_SAFE = 5.0   # s     target conflict time-gap (bump τ_c up to here)
+DELTA_SAFE = 7.5   # s     target conflict time-gap (bump τ_c up to here)
 STOP_OFFSET = 6.0  # m     yield stop-line: halt this far BEFORE the conflict point (keep box clear)
 P_TIE      = 1.0   # m/s   platoon-pressure tie margin (|ΔP| within this = tie → ETA breaks it)
 TIE_EPS    = 1.5   # s     ETA band for the near-tie tiebreaker (slower vehicle yields)
@@ -76,7 +76,12 @@ _SQRT_AB = math.sqrt(A_MAX * B_MAX)   # for the IDM closing term
 # ARD Matérn-1/2 length-scales, one per feature axis (g, τ_c, r).  ℓ_r is small so the
 # two ROLE columns (yield/pass) are nearly independent — role acts as a near-hard switch,
 # not a quantity to interpolate across.
-LENGTHSCALES = (1.0, 2.0, 0.3)   # (ℓ_g, ℓ_τc in s, ℓ_r)
+LENGTHSCALES = (0.7, 1.4, 0.3)   # (ℓ_g, ℓ_τc in s, ℓ_r) — shortened ~30% (2026-06) so the
+                                 # kernel's reach is tighter around the anchors: between
+                                 # anchors the posterior reverts to the PRIOR MEAN sooner,
+                                 # giving the learned mean f more authority mid-cell.
+                                 # (With f≡0 this also deepens zero-reversion dips between
+                                 # anchors — re-validated against the cosim baseline.)
 GP_JITTER    = 1e-6
 
 # 3-D anchor grid in (g, τ_c, r) space.  r ∈ {0 = YIELDER, 1 = PASSER}.  Targets are
@@ -510,6 +515,7 @@ def controller_acceleration(
     brake_floor=True, predecessor=True,
     pred_override=None,
     return_roles=False,
+    return_feat=False,
     mean_fn=None,
 ):
     """
@@ -620,6 +626,12 @@ def controller_acceleration(
         a_damped = a_prev + kappa * (a_raw - a_prev)
         a_out = torch.where(a_raw < a_prev, a_raw, a_damped) if brake_exempt else a_damped
 
+    # feat = [..., 3] live query features (g, τ_c, r) — exposed so a downstream
+    # hinge-gradient polish can build the controller's own ARD Gram K^φ over them.
+    if return_roles and return_feat:
+        return a_out, is_pred, feat
     if return_roles:
         return a_out, is_pred
+    if return_feat:
+        return a_out, feat
     return a_out

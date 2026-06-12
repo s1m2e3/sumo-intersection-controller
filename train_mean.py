@@ -57,8 +57,8 @@ import sim_torch as S
 import cosim_sumo as C
 
 DT       = C.DT                 # 0.1 s — MATCHES the SUMO co-sim step, so role timers
-                                #  (hold=0.25 s latch!), the Angle-2 lag constant, and
-                                #  the gate cadence are identical between train and eval
+                                #  (hold=0.2 s latch, from C.ROLE_HOLD), the Angle-2 lag
+                                #  constant, and the gate cadence are identical train/eval
 T_END    = S.T_END
 V_PHYS   = S.V_PHYS
 L_VEH    = S.L_VEH
@@ -73,14 +73,27 @@ GRAD_WARMUP = 10.0              # s — simulate the first seconds WITHOUT build
                                 #  junction, so the early gradient is ~0 (anchors
                                 #  dominate on the approach) — pure compute savings;
                                 #  the trajectory itself is identical either way
-LAM_S    = 0.5                  # safety-hinge weight — sized so a crash-level hinge
-                                #  (~16-47 in the SUMO proxy sweep) costs as much loss
-                                #  as the ENTIRE velocity integral of a clean episode
-                                #  (J_bar ~0.5): near-misses are never worth the speed
+LAM_S    = 3.0                  # safety-hinge weight.  The hinge is the SMOOTH
+                                #  saturating h²/(1+h) (h = relu(d_hinge − d)): quadratic
+                                #  for shallow intrusions, ~LINEAR for deep ones, so its
+                                #  gradient is BOUNDED (→1 per pair as d→0) by shape —
+                                #  no spike, nothing for the clip to cut.  At h=6.5 the
+                                #  penalty is ~7.5× smaller than the old h², so λ_s is
+                                #  scaled up to keep a crash-level episode costing about
+                                #  its entire velocity integral.
 LAM_C    = 1e-3                 # effort (a²) weight
 D_HINGE  = S.D_SAFE_2D          # hinge fires below the gate's own safety distance
-GRAD_CLIP = 1.0
+GRAD_CLIP = 2.0                 # clip the batch-averaged gradient to norm 2: with the
+                                #  saturating hinge the tail is already bounded by shape,
+                                #  so this binds rarely — but when a window does produce
+                                #  an outsized gradient, it enters Adam at norm ≤ 2
 CKPT     = "mean_net_ckpt.pt"
+
+# mid-cell probe points (g, τ_c, r) — far from anchors, where f has authority; the
+# mean |f| over these is printed per epoch to show whether the function is moving
+F_PROBE  = torch.tensor([[0.6, 2.5, 0.0], [0.6, 2.5, 1.0],
+                         [1.6, 1.2, 0.0], [1.6, 1.2, 1.0],
+                         [2.7, 6.2, 1.0]])
 
 # ── initial-condition pool: realized SUMO departures, collected once ────────────
 IC_FLOWS = (300, 400, 500)
@@ -171,6 +184,7 @@ class EpisodeStepper:
         # episode accumulators (floats, reporting only)
         self.loss_f = self.j_sum_f = self.hinge_f = self.eff_f = 0.0
         self.eff_n = self.arrived = 0
+        self.f_abs = 0.0; self.f_n = 0      # mean |f| at the mid-cell probe points
 
     def done(self):
         return self.step_i >= self.n_steps
@@ -272,6 +286,9 @@ class EpisodeStepper:
                 ctx = mean_net.build_context(v_a, gap, v_lead, P, behind_n, d_junc,
                                              ego_d, rival_d, valid, roles)
                 mean_fn = model.make_mean_fn(model.encode(*ctx))
+                with torch.no_grad():       # diagnostic only: |f| at mid-cell probes
+                    fp = mean_fn(F_PROBE.unsqueeze(0).expand(Na, -1, -1))
+                    self.f_abs += float(fp.abs().mean()); self.f_n += 1
 
                 # steps 1–3: conditional mean (gradient lives here)
                 a_gp, yield_mask = utils.controller_acceleration(
@@ -325,7 +342,11 @@ class EpisodeStepper:
                     cross = cross & torch.triu(torch.ones_like(cross), 1)
                     if bool(cross.any()):
                         dist = (xy.unsqueeze(0) - xy.unsqueeze(1)).norm(dim=-1)
-                        hinge = (F_t.relu(D_HINGE - dist[cross]) ** 2).sum()
+                        # SMOOTH SATURATING penalty h²/(1+h): quadratic for shallow
+                        # intrusions, ~linear for deep — gradient bounded by SHAPE
+                        # (no clamp, no cut gradients, no spikes into Adam)
+                        h = F_t.relu(D_HINGE - dist[cross])
+                        hinge = (h ** 2 / (1.0 + h)).sum()
                 eff = (a_gp ** 2).mean()
 
                 # hinge enters as a TIME INTEGRAL (×DT) so its scale — and λ_s's
@@ -373,7 +394,7 @@ def main():
     fresh  = "fresh" in sys.argv[1:]
     epochs = int(args[0]) if len(args) > 0 else 30
     batch  = int(args[1]) if len(args) > 1 else 8
-    lr     = float(args[2]) if len(args) > 2 else 3e-4
+    lr     = float(args[2]) if len(args) > 2 else 3e-3
     torch.manual_seed(0)
     random.seed(0)
 
@@ -381,20 +402,26 @@ def main():
     geo, s_cp, path_len, s_junc = S.build_geometry()
     jgeo = junction_geometry(geo)
     model = mean_net.MeanTransformer()
-    best_j = -1.0
+    best_score = -1e9
     if os.path.exists(CKPT) and not fresh:
         ck = torch.load(CKPT, weights_only=True)
         if isinstance(ck, dict) and "state_dict" in ck:        # current format
             model.load_state_dict(ck["state_dict"])
-            best_j = float(ck.get("best_j", -1.0))
+            # legacy best_j (J-only criterion) is NOT comparable to the combined
+            # score — start the bar fresh, weights kept
+            best_score = float(ck.get("best_score", -1e9))
         else:                                                  # legacy: bare state_dict
             model.load_state_dict(ck)
-        print(f"RESUMING from {CKPT} — best model so far (mean J̄={best_j:.4f}); "
+        print(f"RESUMING from {CKPT} — best model so far (score={best_score:.4f}); "
               f"pass 'fresh' to start from zero-init")
     else:
         print("starting from the zero-initialized model"
               + (" (fresh requested)" if fresh else f" ({CKPT} not found)"))
-    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+    # β₂=0.95: short second-moment memory (~20 updates) so one outlier gradient can't
+    # throttle the effective step size for hundreds of updates (we take only ~11/epoch).
+    # The hot lr is SAFE here: f is tanh-bounded, anchor-pinned, and double-shielded —
+    # a bad f gets corrected, it cannot crash anything.
+    opt   = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.95))
 
     n_windows = int(T_END / WINDOW_S)
     print(f"\ntraining: {epochs} epochs × batch {batch} (pool {len(pool)} SUMO scenarios), "
@@ -404,6 +431,7 @@ def main():
 
     for ep_i in range(epochs):
         t0 = time.time()
+        theta0 = torch.cat([p.detach().flatten().clone() for p in model.parameters()])
         scenarios = random.sample(pool, min(batch, len(pool)))
         steppers = [EpisodeStepper(sc["events"], geo, s_cp, path_len, s_junc, jgeo)
                     for sc in scenarios]
@@ -432,24 +460,34 @@ def main():
                   f"{(w+1)*WINDOW_S:3.0f}s  mean_win_loss={w_loss/B:+.4f}  "
                   f"hinge={w_hinge/B:6.2f}  |grad|={gnorm:.3f}  ({time.time()-tw:.1f}s)")
 
-        ep_j, ep_hinge, ep_arr = 0.0, 0.0, 0
+        ep_j, ep_hinge, ep_arr, ep_f, ep_score = 0.0, 0.0, 0, 0.0, 0.0
         for sc, st in zip(scenarios, steppers):
             j = st.j_norm()
+            # combined selection score, SAME sign convention as the loss:
+            # maximize J̄ − λ_s·(hinge integral)/N — fast AND clean, never one alone
+            score = j - LAM_S * st.hinge_f / st.Ntot
             print(f"    [epoch {ep_i:3d}] episode  flow={sc['flow']} "
                   f"seed={sc['seed']:2d}  J̄={j:.4f}  hinge={st.hinge_f:7.2f}  "
-                  f"arrived={st.arrived}")
+                  f"score={score:+.4f}  arrived={st.arrived}")
             ep_j += j; ep_hinge += st.hinge_f; ep_arr += st.arrived
-        ep_j /= B
+            ep_f += st.f_abs / max(st.f_n, 1); ep_score += score
+        ep_j /= B; ep_score /= B
+        theta1 = torch.cat([p.detach().flatten() for p in model.parameters()])
+        dtheta = float((theta1 - theta0).norm())
         print(f"  epoch {ep_i:3d}  mean_J̄={ep_j:.4f}  mean_hinge={ep_hinge/B:7.2f}  "
-              f"arrived={ep_arr}  updates={n_upd}  ({time.time()-t0:.1f}s)\n")
+              f"score={ep_score:+.4f}  arrived={ep_arr}  updates={n_upd}  "
+              f"⟨|f|⟩={ep_f/B:.4f} m/s²  ‖Δθ‖={dtheta:.4f}  ({time.time()-t0:.1f}s)\n")
 
-        # the checkpoint is always the BEST model (by epoch mean J̄, carried across runs)
-        if ep_j > best_j:
-            best_j = ep_j
-            torch.save({"state_dict": model.state_dict(), "best_j": best_j}, CKPT)
-            print(f"  ↳ new best mean J̄={best_j:.4f} — checkpoint saved to {CKPT}\n")
+        # the checkpoint is always the BEST model by the COMBINED score
+        # (J̄ − λ_s·hinge/N, carried across runs)
+        if ep_score > best_score:
+            best_score = ep_score
+            torch.save({"state_dict": model.state_dict(), "best_score": best_score,
+                        "best_j": ep_j}, CKPT)
+            print(f"  ↳ new best score={best_score:+.4f} (J̄={ep_j:.4f}) — "
+                  f"checkpoint saved to {CKPT}\n")
 
-    print(f"done. best mean J̄={best_j:.4f}  checkpoint (best): {CKPT}")
+    print(f"done. best score={best_score:+.4f}  checkpoint (best): {CKPT}")
 
 
 if __name__ == "__main__":

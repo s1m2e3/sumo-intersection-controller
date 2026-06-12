@@ -46,7 +46,8 @@ D_SCALE   = 100.0          # m    distances (approach is 200 m, assign window 10
 V_SCALE   = utils.V0       # m/s  speeds
 ETA_SCALE = 10.0           # s    ETAs / ETA margins
 P_SCALE   = 10.0           # veh  platoon pressure / counts behind
-F_LIM     = 3.0            # m/s² hard bound on the prior-mean output |f|
+F_LIM     = 3.0            # m/s² smooth bound on the prior-mean output |f| (tanh squash,
+                          #      differentiable everywhere; saturates at ±F_LIM, never exceeds)
 
 EGO_DIM   = 7              # (v, gap, v_lead, role, P, behind_n, d_junc)
 RIVAL_DIM = 7              # (ego_d, rival_d, v_j, eta_j, eta_margin, role_j, P_j)

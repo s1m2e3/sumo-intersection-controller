@@ -134,6 +134,26 @@ GATE_BRAKE_HARD = -utils.B_MAX  # m/s² deeper floor used ONLY to avoid an alrea
 EPS_ENTRY = 0.5        # m    min room before the stop-line for a box-exclusivity halt to apply
                        #      (below this it's effectively at the line / committed → let it go).
 
+# ── RKHS-smoothed hinge-gradient polish (runs AFTER rollout_gate) ─────────────────
+# A differentiable refinement that directly descends the SAME 2-D hinge the cosim
+# probe reports — Σ relu(d_safe − ‖c_i−c_j‖)² over ALL cross-axis pairs near the box,
+# integrated over the constant-accel rollout.  Unlike the discrete GATE_STEP search
+# (one rival at a time, ±0.45 m/s²), the gradient couples every conflicting pair at
+# once and is smoothed through the controller's own ARD Gram K^φ (the "RKHS gradient":
+# Δa = −η · K^φ ∇_a Ĵ), so vehicles with similar features (g, τ_c, r) move together.
+HINGE_GATE   = True    #      master toggle for the polish pass
+N_HINGE_STEPS = 3      #      projected-gradient steps per call (kept small for 0.1-s budget)
+HINGE_ETA    = 2.0     #      step size η (the L2 gradient magnitudes are O(1), so η~O(1))
+HINGE_DA_MAX = 3.0     # m/s² per-step clamp on |Δa| (lets the polish brake past the gate's
+                       #      −3 comfort floor toward −B_MAX when a conflict is imminent)
+HINGE_RKHS   = False   #      L2 gradient (K^φ = I).  The K^φ-smoothed "RKHS" step couples
+                       #      vehicles with similar (g,τ_c,r) and so AVERAGES AWAY the
+                       #      anti-correlated corrections a conflict needs (one yields, one
+                       #      proceeds) — measured to break descent.  For this hinge the L2
+                       #      gradient is the same object without that harmful smoothing.
+HINGE_RIDGE  = 0.0     #      Tikhonov ridge λ added to K^φ before the step (only if RKHS)
+_HINGE_DBG   = None    #      set to a list to collect (J_first, J_last) per polish call (debug)
+
 
 def _rollout_xy(geo, mv, s_center):
     """(x,y) of vehicle CENTRES at future arc-lengths.  mv [M], s_center [M,K] → [M,K,2]."""
@@ -342,6 +362,110 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
     return (a_corr, defer) if return_defer else a_corr
 
 
+def hinge_gradient_gate(a, feat, s, v, mv, geo, s_junc, delta_safe=None,
+                        n_steps=None, eta=None, da_max=None):
+    """RKHS-smoothed projected-gradient polish that DIRECTLY minimizes the predicted
+    2-D hinge, run as a refinement AFTER rollout_gate (role logic / box-exclusivity
+    already applied to `a`).
+
+    Predicted hinge over the constant-accel rollout (the same kinematics the gate uses):
+
+        v_i(τ) = clamp(v_i + a_i τ, 0, V_PHYS),  c_i(τ) = γ_i(s_i − L/2 + ∫₀^τ v_i)
+        Ĵ(a)   = Σ_k Δτ  Σ_{(i,j)∈C} [ ( d_safe − ‖c_i(τ_k) − c_j(τ_k)‖ )₊ ]²
+
+    C = ALL cross-axis pairs in the junction window (the relu zeroes the rest, so every
+    pair that WOULD come within d_safe contributes — the multi-rival coupling).  The
+    gradient ∇_a Ĵ is obtained by autograd through the rollout; the step is smoothed by
+    the controller's ARD Gram K^φ over the live features (the functional gradient in the
+    kernel's RKHS):
+
+        a ← Π_[−B_MAX, A_MAX] ( a − η · K^φ ∇_a Ĵ ),   K^φ_{ij} = k(φ_i, φ_j).
+
+    Returns a NEW command vector (same shape as `a`); vehicles outside the window are
+    untouched.  Differentiable end-to-end (the per-step grad is taken on a detached
+    leaf, but the op set is autograd-friendly, so the whole pass can also be embedded in
+    a training loss later)."""
+    # resolve hyperparameters from module globals AT CALL TIME (so they stay tunable,
+    # e.g. from a sweep that sets sim_torch.HINGE_ETA) — not frozen as default args.
+    n_steps = N_HINGE_STEPS if n_steps is None else n_steps
+    eta     = HINGE_ETA     if eta     is None else eta
+    da_max  = HINGE_DA_MAX  if da_max  is None else da_max
+    ds      = utils.DELTA_SAFE if delta_safe is None else delta_safe
+    d_safe  = D_SAFE_2D + DSAFE_GATE_GAIN * ds
+    d_to_junc = s_junc[mv] - s
+    reach   = (v * H_2D + D_SAFE_2D).clamp(min=JCT_AHEAD)
+    near    = (d_to_junc <= reach) & (d_to_junc >= -JCT_PAST)
+    idx     = near.nonzero().flatten()
+    n = len(idx)
+    if n < 2:
+        return a
+
+    ax       = _AXIS[mv[idx]]
+    pairmask = (ax.unsqueeze(0) != ax.unsqueeze(1)) & torch.triu(
+        torch.ones(n, n, dtype=torch.bool), 1)                 # cross-axis, each pair once
+    if not bool(pairmask.any()):
+        return a
+
+    s_i, v_i, mv_i = s[idx], v[idx], mv[idx]
+    t   = torch.arange(1, K_2D + 1, dtype=a.dtype) * DT_2D      # [K] rollout times
+    if HINGE_RKHS:
+        ls   = torch.tensor(utils.LENGTHSCALES, dtype=feat.dtype)
+        Kphi = utils._kernel_gram(feat[idx], ls)               # [n,n] controller's ARD Gram
+        if HINGE_RIDGE:
+            Kphi = Kphi + HINGE_RIDGE * torch.eye(n, dtype=Kphi.dtype)
+    else:
+        Kphi = torch.eye(n, dtype=a.dtype)                     # plain per-command step (I)
+    pm   = pairmask.unsqueeze(-1)                              # [n,n,1]
+
+    a_set = a[idx].clone()
+    a_in  = a[idx].clone()
+    J_first = J_last = None
+    _dbg_first: dict = {}                                      # per-call mechanism probe
+    for _ in range(n_steps):
+        a_leaf = a_set.detach().requires_grad_(True)
+        v_prof = (v_i.unsqueeze(1) + a_leaf.unsqueeze(1) * t).clamp(0.0, V_PHYS)   # [n,K]
+        s_t    = (s_i - L_VEH / 2.0).unsqueeze(1) + torch.cumsum(v_prof * DT_2D, dim=1)  # [n,K]
+        xy     = _rollout_xy(geo, mv_i, s_t)                   # [n,K,2]
+        d      = (xy.unsqueeze(1) - xy.unsqueeze(0)).norm(dim=-1)   # [n,n,K]
+        J      = (torch.relu(d_safe - d).pow(2) * pm).sum() * DT_2D
+        if J_first is None:
+            J_first = float(J)
+        J_last = float(J)
+        if float(J) == 0.0:
+            break
+        grad, = torch.autograd.grad(J, a_leaf)                 # [n] Euclidean per-command grad
+        if _HINGE_DBG is not None and _dbg_first.get("done") is None:
+            # mechanism probe on the FIRST acting iteration: who violates, are they
+            # moving (β≠0), and is the gradient actually nonzero on them?
+            viol = ((d < d_safe) & pm)                         # [n,n,K]
+            inv  = viol.any(-1).any(-1) | viol.any(-1).any(0)  # [n] vehicles in a violation
+            at_lim = (a_in <= -utils.B_MAX + 1e-3) | (a_in >= utils.A_MAX - 1e-3)
+            _dbg_first.update(done=True, gmax=float(grad.abs().max()),
+                              n_grad=int((grad.abs() > 1e-6).sum()),
+                              n_viol=int(inv.sum()),
+                              viol_vmin=float(v_i[inv].min()) if bool(inv.any()) else -1.0,
+                              viol_vmax=float(v_i[inv].max()) if bool(inv.any()) else -1.0,
+                              viol_gmax=float(grad[inv].abs().max()) if bool(inv.any()) else 0.0,
+                              viol_atlim=int((inv & at_lim).sum()),
+                              viol_ainmin=float(a_in[inv].min()) if bool(inv.any()) else 0.0,
+                              viol_ainmax=float(a_in[inv].max()) if bool(inv.any()) else 0.0)
+        step  = (-eta * (Kphi @ grad)).clamp(-da_max, da_max)  # RKHS-smoothed, magnitude-capped
+        a_set = (a_set + step).clamp(-utils.B_MAX, utils.A_MAX)
+    if _HINGE_DBG is not None and J_first:
+        da = (a_set - a_in)                                    # net change this call
+        rec = dict(J_first=J_first, J_last=J_last, n=n,
+                   n_accel=int((da > 1e-4).sum()), n_brake=int((da < -1e-4).sum()),
+                   max_accel=float(da.clamp(min=0).max()),
+                   max_brake=float((-da).clamp(min=0).max()))
+        rec.update({k: v for k, v in _dbg_first.items() if k != "done"})
+        _HINGE_DBG.append(rec)
+        _dbg_first.clear()
+
+    out = a.clone()
+    out[idx] = a_set
+    return out
+
+
 # ── simulation ──────────────────────────────────────────────────────────────────
 def gen_events(flow, seed):
     """Poisson arrival schedule: list of (depart_time, move_idx), sorted by time."""
@@ -360,7 +484,8 @@ def gen_events(flow, seed):
 
 
 def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
-             events=None, gate2d=True, dt=DT, verbose=False, mean_model=None):
+             events=None, gate2d=True, dt=DT, verbose=False, mean_model=None,
+             hinge_gate=HINGE_GATE):
     DT_ = dt
     if geo is None:
         geo, s_cp, path_len, s_junc = build_geometry()
@@ -376,6 +501,7 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
 
     collided, arrived, coll_steps = set(), 0, 0
     pair_kinds: set = set()             # (i, j, 'rear'|'cross') distinct colliding pairs
+    hinge_total = 0.0                   # realized 2-D hinge (same metric as the cosim probe)
     n_steps = int(T_END / DT_)
 
     for step in range(n_steps):
@@ -459,13 +585,18 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
             d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
             ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
             a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
-            return_roles=gate2d, pred_override=pred_override, mean_fn=mean_fn)
+            return_roles=gate2d, return_feat=gate2d,
+            pred_override=pred_override, mean_fn=mean_fn)
         if gate2d:
-            a, yield_mask = out
+            a, yield_mask, feat = out
             if verbose and step % 20 == 0:
                 print(f"  t={t:5.1f}s  active={Na}")
             a = rollout_gate(a.detach(), s_a, v_a, mv_a, yield_mask, geo, s_junc,
                              verbose=verbose and step % 20 == 0)
+            # RKHS-smoothed hinge polish AFTER the role-based gate (box-exclusivity intact)
+            if hinge_gate:
+                a = hinge_gradient_gate(a.detach(), feat.detach(),
+                                        s_a, v_a, mv_a, geo, s_junc).detach()
         else:
             a = out.detach()
 
@@ -496,6 +627,17 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
                     pair_kinds.add((int(act[i]), int(act[j]), kind))
         coll_steps += int(any_hit)
 
+        # realized 2-D hinge probe (identical metric to cosim_sumo / run_sweep): cross-axis
+        # CENTRE pairs near the box, Σ relu(D_SAFE_2D − d)² · dt.  `xy` here holds the centres
+        # at s_new (last s_chk), so it is reused directly.  Plain 6.5 m floor (NOT widened).
+        d_to_j = s_junc[mv_a] - s_new
+        nh = ((d_to_j > -JCT_PAST) & (d_to_j < 60.0)).nonzero().flatten()
+        if len(nh) >= 2:
+            dd = (xy[nh].unsqueeze(0) - xy[nh].unsqueeze(1)).norm(dim=-1)
+            crossh = (ax_a[nh].unsqueeze(0) != ax_a[nh].unsqueeze(1)) & torch.triu(
+                torch.ones(len(nh), len(nh), dtype=torch.bool), 1)
+            hinge_total += float((torch.relu(D_SAFE_2D - dd[crossh]).pow(2)).sum()) * DT_
+
         # exit
         done = act[s[act] >= path_len[mv_a]]
         state[done] = 2
@@ -505,7 +647,8 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
     n_rear  = sum(1 for *_, k in pair_kinds if k == "rear")
     n_cross = sum(1 for *_, k in pair_kinds if k == "cross")
     return dict(flow=flow, seed=seed, collided=len(collided), coll_steps=coll_steps,
-                arrived=arrived, ss_rate=ss, n_rear=n_rear, n_cross=n_cross)
+                arrived=arrived, ss_rate=ss, n_rear=n_rear, n_cross=n_cross,
+                hinge=hinge_total)
 
 
 if __name__ == "__main__":
