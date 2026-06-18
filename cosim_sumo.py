@@ -165,7 +165,7 @@ def _cp_tensors(net_path):
 
 def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=None,
         gate2d=True, role_hold=ROLE_HOLD, mean_model=None, hinge_probe=False,
-        hinge_gate=False):
+        hinge_gate=False, conflict_probe=False):
     routes   = routes_override or os.path.join(HERE, f"_cosim_routes_{flow}.rou.xml")
     net_path = os.path.join(HERE, "intersection.net.xml")
     if routes_override is None:
@@ -212,6 +212,11 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
     track_log = {v: [] for v in track}
     arrived_series = []
     speed_sum, speed_cnt = 0.0, 0          # network-mean speed over all vehicle-steps
+    accel_sq, accel_n = 0.0, 0             # control ENERGY: Σ a² over vehicle-steps
+    jerk_sq,  jerk_n  = 0.0, 0             # SMOOTHNESS: Σ (Δa)² (total change of accel)
+    # conflict-gap probe: τ_c (= conflict_time_gap) over egos that actually have a valid
+    # crossing rival, tracked over the whole run (min = closest call, max = loosest)
+    tc_min, tc_max, tc_sum, tc_n = float("inf"), 0.0, 0.0, 0
     n_steps = int(T_END / DT)
 
     for step in range(n_steps):
@@ -284,6 +289,16 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
         ego_d   = torch.nan_to_num(ego_d,   nan=1e3)
         rival_d = torch.nan_to_num(rival_d, nan=-1e3)
 
+        # ── conflict-gap probe: same τ_c the controller sees, over conflicted egos ──────
+        if conflict_probe:
+            has_conf = valid.any(dim=1)
+            if bool(has_conf.any()):
+                tau_c_all, *_ = utils.conflict_time_gap(ego_d, vs, rival_d, rival_v, valid)
+                tcv = tau_c_all[has_conf]
+                tc_min = min(tc_min, float(tcv.min()))
+                tc_max = max(tc_max, float(tcv.max()))
+                tc_sum += float(tcv.sum()); tc_n += int(tcv.numel())
+
         # ── hinge probe (proxy diagnostics; SUMO position = FRONT centre → shift L/2 back)
         if hinge_probe:
             half = utils.L_VEH / 2.0
@@ -329,7 +344,7 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
         if mean_model is not None:
             import mean_net
             ctx = mean_net.build_context(vs, gap, v_lead, P, behind_n, d_junc,
-                                         ego_d, rival_d, valid, roles_i)
+                                         ego_d, rival_d, valid, roles_i, axis, sgn)
             mean_fn = mean_model.make_mean_fn(mean_model.encode(*ctx))
 
         xe = torch.zeros(N)
@@ -375,6 +390,10 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
             # deadlock breaker is driving it OUT (clamping there freezes it in the box)
             if roles_i[i] == 'yield' and not in_box_v[i]:
                 ai = min(ai, 0.0)
+            ai_prev = prev_a.get(v)              # previous applied accel (None if new vehicle)
+            accel_sq += ai * ai; accel_n += 1
+            if ai_prev is not None:              # skip the 0→a₀ jump on a fresh vehicle
+                jerk_sq += (ai - ai_prev) ** 2; jerk_n += 1
             prev_a[v] = ai
             v_new = float(min(max(float(vs[i]) + ai * DT, 0.0), V_PHYS))
             # PASSER keeps moving (non-zero v) — but ONLY with room ahead, so the floor never
@@ -423,6 +442,11 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
                 collided=len(collided), collision_steps=collision_steps,
                 col_details=col_details, track_log=track_log,
                 hinge=hinge_total, hinge_pairs=hinge_pairs,
+                energy=accel_sq / max(accel_n, 1),     # mean a²  (control energy)
+                jerk=jerk_sq / max(jerk_n, 1),         # mean (Δa)²  (smoothness)
+                tau_c_min=(tc_min if tc_n else float("nan")),
+                tau_c_max=(tc_max if tc_n else float("nan")),
+                tau_c_mean=(tc_sum / tc_n if tc_n else float("nan")),
                 collided_ids=sorted(collided))
 
 
@@ -450,17 +474,17 @@ if __name__ == "__main__":
     mean_model = None
     if "nn" in tokens:
         import mean_net
-        mean_model = mean_net.MeanTransformer()
+        mean_model = mean_net.make_mean_model()
         mean_model.eval()
         print("nn: fresh ZERO-INIT prior mean attached (must match the plain kernel)")
     elif "nonn" not in tokens:
-        ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mean_net_ckpt.pt")
+        import mean_net
+        ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)), mean_net.ckpt_path("best"))
         if os.path.exists(ckpt):
-            import mean_net
             ck = torch.load(ckpt, weights_only=True)
             sd, bj = ((ck["state_dict"], ck.get("best_j"))
                       if isinstance(ck, dict) and "state_dict" in ck else (ck, None))
-            mean_model = mean_net.MeanTransformer()
+            mean_model = mean_net.make_mean_model()
             mean_model.load_state_dict(sd)
             mean_model.eval()
             print(f"loaded best trained prior mean from {os.path.basename(ckpt)}"
@@ -487,6 +511,8 @@ if __name__ == "__main__":
     print(f"  steady-state throughput        : {r['ss_rate']:.0f} veh/h")
     print(f"  vehicles in a SUMO collision   : {r['collided']}")
     print(f"  steps with a collision         : {r['collision_steps']}")
+    print(f"  control energy  (mean a²)      : {r['energy']:.4f} (m/s²)²")
+    print(f"  smoothness  (mean (Δa)²)       : {r['jerk']:.4f} (m/s²)²")
     if r["col_details"]:
         print("  --- collision contexts (t, veh, road, zone, axis, x, y, v) ---")
         for d in r["col_details"]:

@@ -64,7 +64,7 @@ T_HW     = 1.5     # s     desired time headway
 V0       = 11.0    # m/s   free / desired speed (open-road cap)
 DELTA    = 4.0     # —     IDM free-flow exponent
 G_MAX    = 5.0     # —     soft clamp on the gap ratio g (open-road saturation)
-DELTA_SAFE = 7.5   # s     target conflict time-gap (bump τ_c up to here)
+DELTA_SAFE = 3.0   # s     target conflict time-gap (bump τ_c up to here)
 STOP_OFFSET = 6.0  # m     yield stop-line: halt this far BEFORE the conflict point (keep box clear)
 P_TIE      = 1.0   # m/s   platoon-pressure tie margin (|ΔP| within this = tie → ETA breaks it)
 TIE_EPS    = 1.5   # s     ETA band for the near-tie tiebreaker (slower vehicle yields)
@@ -76,12 +76,15 @@ _SQRT_AB = math.sqrt(A_MAX * B_MAX)   # for the IDM closing term
 # ARD Matérn-1/2 length-scales, one per feature axis (g, τ_c, r).  ℓ_r is small so the
 # two ROLE columns (yield/pass) are nearly independent — role acts as a near-hard switch,
 # not a quantity to interpolate across.
-LENGTHSCALES = (0.7, 1.4, 0.3)   # (ℓ_g, ℓ_τc in s, ℓ_r) — shortened ~30% (2026-06) so the
-                                 # kernel's reach is tighter around the anchors: between
-                                 # anchors the posterior reverts to the PRIOR MEAN sooner,
-                                 # giving the learned mean f more authority mid-cell.
-                                 # (With f≡0 this also deepens zero-reversion dips between
-                                 # anchors — re-validated against the cosim baseline.)
+LENGTHSCALES = (0.5, 1.0, 0.3, 0.3)   # (ℓ_g, ℓ_τc in s, ℓ_r, ℓ_p) — ℓ_p small ⇒ the promotion
+                                 # sheets p=0/p=1 decouple (cross-sheet weight exp(−1/ℓ_p)≈0.04),
+                                 # so a vehicle reads the normal field at p=0 and the promotion
+                                 # (pass) field at p=1.  Below: (was 0.7/1.4) so the
+                                 # anchors' reach (their "radius" in the g–τ_c plane) is SMALLER:
+                                 # the posterior reverts to the PRIOR MEAN sooner between anchors,
+                                 # giving the learned mean f MORE room to operate (incl. the
+                                 # passer free-flow region).  With f≡0 this deepens the zero-
+                                 # reversion dips between anchors → re-validate the cosim baseline.
 GP_JITTER    = 1e-6
 
 # 3-D anchor grid in (g, τ_c, r) space.  r ∈ {0 = YIELDER, 1 = PASSER}.  Targets are
@@ -95,25 +98,46 @@ GP_JITTER    = 1e-6
 # Denser g ladder (0.75, 1.25, 1.5, 2.5) through the active car-following band → sharper
 # reactivity to the longitudinal gap; τ_c gains a ½·δ_safe level for finer cross timing.
 _G_LEVELS    = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
+_TAUC_EXTRA = (2.0, 5.5)         # extra τ_c anchor rows for denser interpolation support
+                                 # (2.0: more brake support in the yielder sub-δ_safe band /
+                                 #  blue for passers; 5.5: fills the passer blue between δ_safe
+                                 #  and TAU_C_MAX)
 def _tauc_levels(ds):
-    return (0.0, 0.5 * ds, ds, TAU_C_MAX)
+    return tuple(sorted(set((0.0, 0.5 * ds, ds, TAU_C_MAX) + _TAUC_EXTRA)))
 _TAUC_LEVELS = _tauc_levels(DELTA_SAFE)
 _ROLE_LEVELS = (0.0, 1.0)        # 0 = YIELDER, 1 = PASSER
 
-def _anchor_target(g: float, tc: float, r: float):
+_PROMO_LEVELS = (0.0, 1.0)       # 0 = normal, 1 = PROMOTED (asserts through, drops cross yield)
+
+def _anchor_target(g: float, tc: float, r: float, p: float = 0.0):
+    if p >= 0.5:
+        # PROMOTION: the vehicle PASSES — the cross-conflict yield is dropped — but it
+        # still keeps longitudinal safety: no gap (g<1) ⇒ it cannot push (brakes).
+        if g < 1.0:
+            return "brake"                      # no gap → can't push (rear-end safety kept)
+        if tc == 0.0:
+            return "clear"                      # assert through the conflict point (a_max)
+        return "free"                           # free-flow, IGNORE the cross timing τ_c
+    # p == 0 → normal behavior (unchanged)
     if g < 1.0:
         return "brake"                          # longitudinal safety dominates for both roles
     if tc == 0.0:
         return "clear" if r >= 0.5 else "yield" # passer asserts & clears; yielder brakes to line
     if g == 1.0:
         return 0.0                              # HOLD at desired gap
-    # g ≥ 2:
-    if tc >= TAU_C_MAX:
-        return "free" if r >= 0.5 else 0.0      # passer free-flows on clear road; yielder HOLDS
-    return 0.0                                  # δ_safe pin (both roles)
+    # g ≥ 2 (room ahead):
+    if r >= 0.5:
+        return "free"                           # PASSER: priority + room ⇒ free-flow at ANY τ_c>0
+                                                # (τ_c=0 handled above as 'clear'=a_max assert) —
+                                                # a passer always accelerates
+    # YIELDER: keep braking (cross-yield decel) as long as the conflict margin is unmet
+    # (τ_c < δ_safe) — it must actively open the gap, not just hold; once τ_c ≥ δ_safe the
+    # δ_safe margin is satisfied → HOLD at the desired spacing.
+    return 0.0 if tc + 1e-9 >= DELTA_SAFE else "yield"
 
-ANCHOR_FEATS   = tuple((g, tc, r) for g in _G_LEVELS for tc in _TAUC_LEVELS for r in _ROLE_LEVELS)
-ANCHOR_TARGETS = tuple(_anchor_target(g, tc, r) for g, tc, r in ANCHOR_FEATS)   # [M]
+ANCHOR_FEATS   = tuple((g, tc, r, p) for g in _G_LEVELS for tc in _TAUC_LEVELS
+                       for r in _ROLE_LEVELS for p in _PROMO_LEVELS)
+ANCHOR_TARGETS = tuple(_anchor_target(g, tc, r, p) for g, tc, r, p in ANCHOR_FEATS)   # [M]
 
 
 def set_delta_safe(value):
@@ -128,8 +152,9 @@ def set_delta_safe(value):
     global DELTA_SAFE, _TAUC_LEVELS, ANCHOR_FEATS, ANCHOR_TARGETS
     DELTA_SAFE     = float(value)
     _TAUC_LEVELS   = _tauc_levels(DELTA_SAFE)
-    ANCHOR_FEATS   = tuple((g, tc, r) for g in _G_LEVELS for tc in _TAUC_LEVELS for r in _ROLE_LEVELS)
-    ANCHOR_TARGETS = tuple(_anchor_target(g, tc, r) for g, tc, r in ANCHOR_FEATS)
+    ANCHOR_FEATS   = tuple((g, tc, r, p) for g in _G_LEVELS for tc in _TAUC_LEVELS
+                           for r in _ROLE_LEVELS for p in _PROMO_LEVELS)
+    ANCHOR_TARGETS = tuple(_anchor_target(g, tc, r, p) for g, tc, r, p in ANCHOR_FEATS)
     _KINV_CACHE.clear()
     return DELTA_SAFE
 
@@ -277,7 +302,8 @@ def cross_resolve_accel(d_ego, v_ego, eta_rival, delta, delta_safe=DELTA_SAFE,
 
 
 def resolve_cross_accel(ego_d, v_ego, rival_d, rival_v, rival_valid,
-                        delta_safe=DELTA_SAFE, a_max=A_MAX, b_max=B_MAX):
+                        delta_safe=DELTA_SAFE, a_max=A_MAX, b_max=B_MAX,
+                        prio_ego=None, prio_rival=None):
     """
     η-ORDERING / FCFS multi-rival resolver (Flaw-1 fix).  Priority is arrival time at
     each pair's conflict point: the EARLIER vehicle has right-of-way.
@@ -297,6 +323,16 @@ def resolve_cross_accel(ego_d, v_ego, rival_d, rival_v, rival_valid,
     of a symmetric 'pass only if you clear everyone' rule.  The exact η-tie is the
     accepted kink.  The τ_c gate down-weights a_cross when no rival is imminent, so a
     priority vehicle only floors it to clear when a conflict is actually close.
+
+    PRIORITY BIAS (optional, prio_ego/prio_rival in SECONDS, broadcastable to η): a
+    head-start added to a movement class's effective arrival time so it wins the
+    right-of-way comparison — e.g. give THROUGH movements priority over turns so the
+    higher-conflict-count throughs don't starve under pure FCFS (a turn conflicts with
+    ~2 movements, a through with ~6, so unbiased FCFS lets turns repeatedly pre-empt
+    throughs → through gridlock at saturation; this is the major-road priority a real
+    junction encodes).  CRUCIAL: the bias ONLY shifts the *who-yields* comparison; the
+    kinematic yield TARGET still uses the REAL η_k (arrive δ_safe behind the actual
+    rival), so safety margins are unchanged — priority changes order, not spacing.
     """
     BIG    = 1e9
     ego_dk = (ego_d if ego_d.shape == rival_d.shape else ego_d.unsqueeze(-1))
@@ -305,7 +341,10 @@ def resolve_cross_accel(ego_d, v_ego, rival_d, rival_v, rival_valid,
     eta_e  = ego_dk / v_e.unsqueeze(-1)                        # [..., K] per-pair ego ETA
     eta_k  = rival_d / rival_v.clamp(min=EPS)                  # [..., K]
 
-    earlier    = rival_valid & (eta_k < eta_e)                 # rivals with right-of-way
+    # right-of-way comparison on PRIORITY-ADJUSTED ETAs (default: no bias → pure FCFS)
+    eta_e_cmp = eta_e if prio_ego   is None else eta_e - prio_ego
+    eta_k_cmp = eta_k if prio_rival is None else eta_k - prio_rival
+    earlier    = rival_valid & (eta_k_cmp < eta_e_cmp)         # rivals with right-of-way
     must_yield = earlier.any(dim=-1)                           # [...]
     any_rival  = rival_valid.any(dim=-1)                       # [...]
 
@@ -514,6 +553,8 @@ def controller_acceleration(
     a_prev=None, kappa=1.0, brake_exempt=True,
     brake_floor=True, predecessor=True,
     pred_override=None,
+    promote=None,                       # [...] per-vehicle promotion flag p∈{0,1} (None ⇒ all 0)
+    prio_ego=None, prio_rival=None,     # optional right-of-way priority bias (s), non-predecessor mode
     return_roles=False,
     return_feat=False,
     mean_fn=None,
@@ -579,7 +620,8 @@ def controller_acceleration(
         tau_c, delta_w, eta_w, any_rival, ego_d_sel, v_rival_sel = conflict_time_gap(
             d_conf, v_ego, rival_d, rival_v, rival_valid)
         a_cross, must_yield = resolve_cross_accel(
-            d_conf, v_ego, rival_d, rival_v, rival_valid, delta_safe=DELTA_SAFE)
+            d_conf, v_ego, rival_d, rival_v, rival_valid, delta_safe=DELTA_SAFE,
+            prio_ego=prio_ego, prio_rival=prio_rival)
         eta_pred, ego_d_pred, v_pred, has_pred, any_cross = (
             eta_w, ego_d_sel, v_rival_sel, must_yield, any_rival)
 
@@ -588,8 +630,11 @@ def controller_acceleration(
     # cosim's queue/latch memory sets has_pred upstream, so the queue promotion (yield→pass)
     # flips the whole role column here.
     r_feat = torch.where(has_pred, torch.zeros_like(g), torch.ones_like(g))
+    # PROMOTION feature p ∈ {0,1}: the kernel's 4th axis.  p=1 anchors prescribe the
+    # pass/clear behavior (cross yield dropped, g<1 brake kept) — see _anchor_target.
+    p_feat = torch.zeros_like(g) if promote is None else promote.to(g.dtype)
 
-    feat = torch.stack([g, tau_c, r_feat], dim=-1)             # [..., 3]
+    feat = torch.stack([g, tau_c, r_feat, p_feat], dim=-1)     # [..., 4]
     anchors = torch.tensor(ANCHOR_FEATS, dtype=feat.dtype, device=feat.device)
     ls = torch.tensor(lengthscales, dtype=feat.dtype, device=feat.device)
 
@@ -611,8 +656,10 @@ def controller_acceleration(
         # the query + the M anchor counterfactuals (context held fixed)
         M = anchors.shape[0]
         anc = anchors.expand(*feat.shape[:-1], M, anchors.shape[-1])
-        phi_all = torch.cat([feat.unsqueeze(-2), anc], dim=-2)     # [..., M+1, 3]
-        f_all = mean_fn(phi_all)                                   # [..., M+1]
+        phi_all = torch.cat([feat.unsqueeze(-2), anc], dim=-2)     # [..., M+1, 4]
+        # the learned mean f is 3-D (g, τ, γ) — it does NOT see promotion; evaluate it on
+        # the 3-D slice so promotion lives ONLY in the prescribed anchor targets.
+        f_all = mean_fn(phi_all[..., :3])                          # [..., M+1]
         a_raw = gp_posterior(feat, anchors, targets, ls,
                              mean_q=f_all[..., 0], mean_X=f_all[..., 1:])
 

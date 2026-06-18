@@ -26,7 +26,7 @@ import cosim_sumo as C
 import sim_torch as S
 
 T_END  = 120.0                      # 120-s horizon for EVERY run in the sweep
-FLOWS  = [300, 400, 500]
+FLOWS  = [500, 600, 700]
 SEEDS  = list(range(25))
 HERE   = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR  = os.path.join(HERE, "outputs")
@@ -39,14 +39,14 @@ SG = torch.tensor([C.ORIGIN[m][1] for m in C._MOVES])   # sign by movement index
 
 
 def load_mean_model():
-    ckpt = os.path.join(HERE, "mean_net_ckpt.pt")
-    if not os.path.exists(ckpt):
-        raise FileNotFoundError("mean_net_ckpt.pt not found — cosim_nn needs the "
-                                "trained prior mean")
     import mean_net
+    ckpt = os.path.join(HERE, mean_net.ckpt_path("best"))
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError(f"{os.path.basename(ckpt)} not found — cosim_nn needs the "
+                                "trained prior mean")
     ck = torch.load(ckpt, weights_only=True)
     sd = ck["state_dict"] if isinstance(ck, dict) and "state_dict" in ck else ck
-    m = mean_net.MeanTransformer()
+    m = mean_net.make_mean_model()
     m.load_state_dict(sd)
     m.eval()
     return m
@@ -56,7 +56,8 @@ def run_cosim(flow, seed, mean_model):
     r = C.run(flow, seed, mean_model=mean_model, hinge_probe=True)
     return dict(avg_velocity=r["avg_speed"],
                 hinge_integral=r["hinge"], avg_hinge=r["hinge"] / T_END,
-                vph=r["ss_rate"], arrived=r["arrived"], collided=r["collided"])
+                vph=r["ss_rate"], arrived=r["arrived"], collided=r["collided"],
+                energy=r["energy"], jerk=r["jerk"])   # mean a², mean (Δa)²
 
 
 def run_krauss(flow, seed):
@@ -78,6 +79,8 @@ def run_krauss(flow, seed):
     configured, move_of = set(), {}
     arrived, collided = [], set()
     hinge_total, speed_sum, speed_cnt = 0.0, 0.0, 0
+    prev_v, prev_a = {}, {}                  # for realized accel (Δv/dt) and jerk (Δaccel)
+    accel_sq, accel_n, jerk_sq, jerk_n = 0.0, 0, 0.0, 0
     for _ in range(n_steps):
         ids = traci.vehicle.getIDList()
         for v in ids:
@@ -92,6 +95,16 @@ def run_krauss(flow, seed):
             ys = torch.tensor([sub[v][tc.VAR_POSITION][1] for v in vehs])
             vs = torch.tensor([sub[v][tc.VAR_SPEED]       for v in vehs])
             speed_sum += float(vs.sum()); speed_cnt += len(vehs)
+            # realized accel from Δspeed, jerk from Δaccel — same energy/smoothness metric
+            for vi, v in enumerate(vehs):
+                spd = float(vs[vi])
+                if v in prev_v:
+                    acc = (spd - prev_v[v]) / C.DT
+                    accel_sq += acc * acc; accel_n += 1
+                    if v in prev_a:
+                        jerk_sq += (acc - prev_a[v]) ** 2; jerk_n += 1
+                    prev_a[v] = acc
+                prev_v[v] = spd
             mv = torch.tensor([move_of[v] for v in vehs])
             axis, sgn = AX[mv], SG[mv]
             cx = xs - torch.where(axis == 0, sgn, torch.zeros_like(sgn)) * half
@@ -114,7 +127,8 @@ def run_krauss(flow, seed):
     traci.close()
     return dict(avg_velocity=speed_sum / max(speed_cnt, 1),
                 hinge_integral=hinge_total, avg_hinge=hinge_total / T_END,
-                vph=ss_rate, arrived=int(np.sum(arrived)), collided=len(collided))
+                vph=ss_rate, arrived=int(np.sum(arrived)), collided=len(collided),
+                energy=accel_sq / max(accel_n, 1), jerk=jerk_sq / max(jerk_n, 1))
 
 
 def aggregates(records):
@@ -132,6 +146,8 @@ def aggregates(records):
                 hinge_integral=float(np.mean([r["hinge_integral"] for r in cell])),
                 vph=float(np.mean([r["vph"] for r in cell])),
                 arrived=float(np.mean([r["arrived"] for r in cell])),
+                energy=float(np.mean([r["energy"] for r in cell])),
+                jerk=float(np.mean([r["jerk"] for r in cell])),
                 collided_total=int(np.sum([r["collided"] for r in cell])))
     return out
 
@@ -168,16 +184,16 @@ def main():
                 k += 1
                 print(f"[{k:3d}/{total}] {ctrl:10s} flow={flow} seed={seed:2d}  "
                       f"throughput={rec['vph']:5.0f} veh/h  "
-                      f"v_avg={rec['avg_velocity']:5.2f} m/s  "
-                      f"hinge/s={rec['avg_hinge']:7.3f}  "
+                      f"hinge/s={rec['avg_hinge']:7.3f}  energy={rec['energy']:6.3f}  "
+                      f"jerk={rec['jerk']:6.3f}  "
                       f"col={rec['collided']}  ({time.time() - t0:4.1f}s)", flush=True)
     print(f"\nDONE: {total} runs in {(time.time() - t_start) / 60:.1f} min "
           f"-> {OUT_JSON}")
     for ctrl, cells in aggregates(records).items():
         for flow, a in cells.items():
-            print(f"  {ctrl:10s} {flow} vph: v_avg={a['avg_velocity']:5.2f} m/s  "
-                  f"hinge/s={a['avg_hinge']:7.3f}  vph={a['vph']:5.0f}  "
-                  f"collided_total={a['collided_total']}")
+            print(f"  {ctrl:10s} {flow} vph: throughput={a['vph']:5.0f}  "
+                  f"hinge/s={a['avg_hinge']:7.3f}  energy={a['energy']:6.3f}  "
+                  f"jerk={a['jerk']:6.3f}  collided_total={a['collided_total']}")
 
 
 if __name__ == "__main__":

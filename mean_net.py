@@ -36,6 +36,8 @@ this module: it consumes the conditional-mean output unchanged, as the outer shi
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -49,21 +51,41 @@ P_SCALE   = 10.0           # veh  platoon pressure / counts behind
 F_LIM     = 3.0            # m/s² smooth bound on the prior-mean output |f| (tanh squash,
                           #      differentiable everywhere; saturates at ±F_LIM, never exceeds)
 
-EGO_DIM   = 7              # (v, gap, v_lead, role, P, behind_n, d_junc)
+EGO_DIM   = 9              # (v, gap, v_lead, role, P, behind_n, d_junc, conf+, conf-)
 RIVAL_DIM = 7              # (ego_d, rival_d, v_j, eta_j, eta_margin, role_j, P_j)
+
+# Columns of ego_feats the context-MLP head consumes (kernel-independent extras):
+#   v (0), behind-density (5), d_junc (6), conflicting-approach densities conf+ (7), conf- (8)
+CONTEXT_COLS = (0, 5, 6, 7, 8)
 
 _ROLE_CODE = {"yield": 0.0, "none": 0.5, "pass": 1.0}
 
 
 def build_context(vs, gap, v_lead, P, behind_n, d_junc,
-                  ego_d, rival_d, valid, roles):
+                  ego_d, rival_d, valid, roles, axis, sgn):
     """Assemble (ego_feats [N,E], rival_feats [N,N,R], rival_mask [N,N]) from the
     co-sim's per-step tensors.  `roles` is the resolved per-vehicle role list
-    ('yield'/'pass'/'none').  All inputs are the [N]/[N,N] tensors cosim already
-    builds; rival rows follow the same convention (entry [i,j] = rival j as seen
-    by ego i, masked by `valid`)."""
+    ('yield'/'pass'/'none'); `axis`/`sgn` are the per-vehicle travel axis (0=x/EW,
+    1=y/NS) and direction sign (±1).  All inputs are the [N]/[N,N] tensors cosim
+    already builds; rival rows follow the same convention (entry [i,j] = rival j as
+    seen by ego i, masked by `valid`)."""
     role_t = torch.tensor([_ROLE_CODE[r] for r in roles],
                           dtype=vs.dtype, device=vs.device)            # [N]
+
+    # ── conflicting-approach densities ──────────────────────────────────────────
+    # count vehicles APPROACHING the box on each (axis, sign) lane; an ego's two
+    # conflicting approaches are the perpendicular axis' + and − directions (EW ego
+    # → NS and SN).  conf+ / conf- = those two counts, by conflicting-lane sign.
+    dt   = vs.dtype
+    appr = ((d_junc > 0.0) & (d_junc < 120.0)).to(dt)                  # [N] approaching
+    onax0 = (axis == 0).to(dt); onax1 = (axis == 1).to(dt)
+    pos   = (sgn > 0).to(dt);   neg = 1.0 - pos
+    n0p = (appr * onax0 * pos).sum(); n0n = (appr * onax0 * neg).sum()
+    n1p = (appr * onax1 * pos).sum(); n1n = (appr * onax1 * neg).sum()
+    # ego on axis 0 conflicts with axis 1 (and vice versa)
+    conf_pos = onax0 * n1p + onax1 * n0p                               # [N]
+    conf_neg = onax0 * n1n + onax1 * n0n                               # [N]
+
     ego_feats = torch.stack([
         vs / V_SCALE,
         gap.clamp(max=300.0) / D_SCALE,
@@ -72,6 +94,8 @@ def build_context(vs, gap, v_lead, P, behind_n, d_junc,
         P / P_SCALE,
         behind_n / P_SCALE,
         d_junc.clamp(-D_SCALE, 3 * D_SCALE) / D_SCALE,
+        conf_pos / P_SCALE,
+        conf_neg / P_SCALE,
     ], dim=-1)                                                         # [N, EGO_DIM]
 
     v_j   = vs.unsqueeze(0).expand_as(rival_d)                         # [N, N]
@@ -139,3 +163,72 @@ class MeanTransformer(nn.Module):
         """Closure with the per-step context baked in — the `mean_fn` argument of
         utils.controller_acceleration (called there at [..., M+1, 3])."""
         return lambda phi: self.head(phi, z)
+
+
+class MeanMLP(nn.Module):
+    """Prior mean  f(φ, c) = head([c, φ])  — an MLP with NO conflict-set encoder.
+
+    The kernel input φ = (g_i, τ_i, γ_i) is ALWAYS a head input; `ctx_cols` selects
+    extra per-ego scalars from build_context's ego_feats (kernel-independent: the
+    kernel/Gram/anchors never see them).  These extras are held fixed per ego and
+    broadcast across the M anchor counterfactuals, so anchor-exactness is retained.
+
+      ctx_cols = ()            → context-free f(φ)        (ARCH "mlp")
+      ctx_cols = CONTEXT_COLS  → f(φ, v, d_junc, densities) (ARCH "mlp_ctx")
+
+    Same contract either way: output ZERO-INITIALIZED (f ≡ 0 at init ⇒ controller ==
+    validated zero-mean kernel) and tanh-bounded to ±F_LIM."""
+
+    def __init__(self, ctx_cols=(), d_head=64):
+        super().__init__()
+        self.ctx_cols = tuple(ctx_cols)
+        self.head_mlp = nn.Sequential(
+            nn.Linear(3 + len(self.ctx_cols), d_head), nn.ReLU(),
+            nn.Linear(d_head, d_head), nn.ReLU())
+        self.head_out = nn.Linear(d_head, 1)
+        # ZERO-INIT ⇒ f ≡ 0 ⇒ controller == validated zero-mean kernel before training
+        nn.init.zeros_(self.head_out.weight)
+        nn.init.zeros_(self.head_out.bias)
+
+    def encode(self, ego_feats, *rest):
+        """Return the per-ego context vector z = ego_feats[:, ctx_cols] ([N, C]).
+        C=0 (empty) for the context-free variant."""
+        return ego_feats[:, list(self.ctx_cols)]
+
+    def head(self, phi, z=None):
+        """phi [N, ..., 3] (raw φ = (g, τ_c, r)) → f [N, ...]; z [N, C] broadcast."""
+        scale = torch.tensor([utils.G_MAX, utils.TAU_C_MAX, 1.0],
+                             dtype=phi.dtype, device=phi.device)
+        h_in = phi / scale
+        if self.ctx_cols:
+            z_e = z.view(z.shape[0], *([1] * (phi.dim() - 2)), z.shape[-1])
+            z_e = z_e.expand(*phi.shape[:-1], z.shape[-1])             # broadcast over anchors
+            h_in = torch.cat([z_e, h_in], dim=-1)
+        return F_LIM * torch.tanh(self.head_out(self.head_mlp(h_in))).squeeze(-1)
+
+    def make_mean_fn(self, z=None):
+        return lambda phi: self.head(phi, z)
+
+
+# ── architecture selector + checkpoint naming ───────────────────────────────────
+# Switch the active prior-mean architecture here:
+#   "mlp_ctx"     = MLP over φ + (v, d_junc, behind/conflicting densities)  [default]
+#   "mlp"         = context-free MLP over φ only
+#   "transformer" = conflict-set attention encoder + head
+ARCH = "mlp_ctx"
+
+
+def make_mean_model():
+    """Instantiate the active prior-mean architecture (see ARCH)."""
+    if ARCH == "transformer":
+        return MeanTransformer()
+    return MeanMLP(ctx_cols=CONTEXT_COLS if ARCH == "mlp_ctx" else ())
+
+
+def ckpt_path(kind="best", here=None):
+    """Architecture-tagged checkpoint filename so the variants never clobber each
+    other.  The transformer keeps the legacy names (mean_net_ckpt.pt / _last.pt)."""
+    base = {"best": "ckpt", "last": "last"}[kind]
+    tag  = "" if ARCH == "transformer" else f"_{ARCH}"
+    name = f"mean_net{tag}_{base}.pt"
+    return os.path.join(here, name) if here else name

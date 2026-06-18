@@ -81,6 +81,57 @@ def _interp(pts, cum, s):
     return xy, torch.atan2(d[:, 1], d[:, 0])
 
 
+_PAD_CACHE = {}
+
+
+def pad_geometry(geo, order=None):
+    """Pack the movement polylines into padded tensors PTS [M,Pmax,2], CUM [M,Pmax]
+    (tail-padded with the last point / arc-length), so _interp_batch can gather a
+    vehicle's polyline by movement index and interpolate ALL movements in one shot
+    instead of a per-movement Python loop.  Cached by (geo identity, order).
+
+    `order` is the ordered list of geo keys whose row i becomes movement index i — so a
+    vehicle's movement index `mv` must index into this same order.  Defaults to the 4
+    straight movements (C._MOVES) for backward compatibility; pass list(range(M)) for the
+    12-movement turn geometry keyed by integer movement idx."""
+    order = C._MOVES if order is None else list(order)
+    key = (id(geo), tuple(order))
+    if key in _PAD_CACHE:
+        return _PAD_CACHE[key]
+    polys = [geo[m] for m in order]
+    Pmax  = max(p[0].shape[0] for p in polys)
+    PTS = torch.zeros(len(polys), Pmax, 2)
+    CUM = torch.zeros(len(polys), Pmax)
+    for i, (pts, cum) in enumerate(polys):
+        P = pts.shape[0]
+        PTS[i, :P] = pts; PTS[i, P:] = pts[-1]
+        CUM[i, :P] = cum; CUM[i, P:] = cum[-1]
+    _PAD_CACHE[key] = (PTS, CUM)
+    return PTS, CUM
+
+
+def _interp_batch(PTS, CUM, mv, s):
+    """Batched _interp: per-vehicle movement mv [M] and arc-length s [M] → xy [M,2],
+    heading [M].  Gathers each vehicle's padded polyline and interpolates at once;
+    numerically identical to looping _interp per movement on xy (tail-pad → degenerate
+    final segments that resolve to the last point at s = path length).  Differentiable
+    in s through the segment fraction t, exactly like _interp."""
+    pts = PTS[mv]                                            # [M, P, 2]
+    cum = CUM[mv]                                            # [M, P]
+    s   = torch.minimum(s.clamp(min=0.0), cum[:, -1])
+    idx = (torch.searchsorted(cum, s.unsqueeze(-1), right=True).squeeze(-1) - 1
+           ).clamp(0, cum.shape[1] - 2)
+    s0  = torch.gather(cum, 1, idx.unsqueeze(-1)).squeeze(-1)
+    s1  = torch.gather(cum, 1, (idx + 1).unsqueeze(-1)).squeeze(-1)
+    t   = ((s - s0) / (s1 - s0).clamp(min=1e-6)).unsqueeze(-1)
+    gi  = idx.view(-1, 1, 1).expand(-1, 1, 2)
+    p0  = torch.gather(pts, 1, gi).squeeze(1)
+    p1  = torch.gather(pts, 1, gi + 1).squeeze(1)
+    xy  = p0 + t * (p1 - p0)
+    d   = p1 - p0
+    return xy, torch.atan2(d[:, 1], d[:, 0])
+
+
 # ── SUMO-faithful collision: oriented-rectangle (footprint) overlap via SAT ─────
 def _corners(xy, heading, hl, hw):
     c, sdir = torch.cos(heading), torch.sin(heading)
@@ -133,6 +184,14 @@ GATE_BRAKE_HARD = -utils.B_MAX  # m/s² deeper floor used ONLY to avoid an alrea
                        #      brake to full −B_MAX to GUARANTEE separation between passers.
 EPS_ENTRY = 0.5        # m    min room before the stop-line for a box-exclusivity halt to apply
                        #      (below this it's effectively at the line / committed → let it go).
+BOX_RESERVE_T = 2.0    # s    a proceeding vehicle only RESERVES the box (excludes crossing
+                       #      streams) once it is within this TIME-to-entry — so the reservation
+                       #      tracks imminent occupancy instead of being claimed many seconds out.
+                       #      The earliest-ETA vehicle of a conflict still reserves first and the
+                       #      farther crosser (which has the room) is still halted, so safety is
+                       #      preserved; bounding the hold-time is what frees throughput for the
+                       #      12-movement case (a fast vehicle no longer blocks the box ~4 s early).
+                       #      Large value ⇒ original "reserve anywhere in the window" behavior.
 
 # ── RKHS-smoothed hinge-gradient polish (runs AFTER rollout_gate) ─────────────────
 # A differentiable refinement that directly descends the SAME 2-D hinge the cosim
@@ -155,17 +214,16 @@ HINGE_RIDGE  = 0.0     #      Tikhonov ridge λ added to K^φ before the step (o
 _HINGE_DBG   = None    #      set to a list to collect (J_first, J_last) per polish call (debug)
 
 
-def _rollout_xy(geo, mv, s_center):
-    """(x,y) of vehicle CENTRES at future arc-lengths.  mv [M], s_center [M,K] → [M,K,2]."""
+def _rollout_xy(geo, mv, s_center, order=None):
+    """(x,y) of vehicle CENTRES at future arc-lengths.  mv [M], s_center [M,K] → [M,K,2].
+    Vectorized: one batched interpolation over all M·K (vehicle, horizon) samples,
+    each carrying its vehicle's movement geometry — no per-movement loop.  `order` is the
+    geo-key order that mv indexes into (see pad_geometry)."""
     M, K = s_center.shape
-    xy = torch.zeros(M, K, 2)
-    for mi in range(4):
-        sel = (mv == mi).nonzero().flatten()
-        if len(sel):
-            pts, cum = geo[C._MOVES[mi]]
-            flat, _ = _interp(pts, cum, s_center[sel].reshape(-1))
-            xy[sel] = flat.reshape(len(sel), K, 2)
-    return xy
+    PTS, CUM = pad_geometry(geo, order)
+    mv_k = mv.unsqueeze(1).expand(M, K).reshape(-1)         # [M*K] movement per sample
+    xy, _ = _interp_batch(PTS, CUM, mv_k, s_center.reshape(-1))
+    return xy.reshape(M, K, 2)
 
 
 JCT_PAST = 30.0   # m past the junction entry beyond which a vehicle has cleared the box
@@ -175,7 +233,8 @@ JCT_AHEAD = 30.0  # m before the junction entry: vehicles within this band are A
 
 
 def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_defer=False,
-                 delta_safe=None, force_roll=None):
+                 delta_safe=None, force_roll=None, conf=None, geo_order=None,
+                 box_exclusive=True):
     """
     Final 2-D safety gate on the kernel command `a`.  SYMMETRIC: it both brakes
     yielders away from danger AND lets priority vehicles accelerate to clear, in each
@@ -228,6 +287,21 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
     if yield_mask is None:
         return (a, defer) if return_defer else a
 
+    # CROSS-CONFLICT predicate between two movements.  The straight gate used the entry
+    # AXIS (E/W vs N/S) as a 2-bucket proxy for "paths cross"; with the 12-movement turn
+    # geometry that is too coarse (a left turn crosses oncoming through on the SAME axis,
+    # and two compatible turns on crossing axes don't actually conflict).  When `conf` (a
+    # [M,M] bool, paths-cross) is supplied, box-exclusivity and the committed-crosser test
+    # key on the TRUE per-pair crossing instead.  Without it, fall back to the axis test —
+    # byte-identical to the original straight behavior (and reduces to the same thing, since
+    # for straights "different axis" ⇔ "paths cross").
+    if conf is not None:
+        def _cross(ma, mb):
+            return bool(conf[ma, mb])
+    else:
+        def _cross(ma, mb):
+            return bool(_AXIS[ma] != _AXIS[mb])
+
     # junction window: only vehicles that can reach/occupy the box within the horizon.
     # Reach is the farther of the speed-dependent horizon distance and a fixed JCT_AHEAD
     # band, so slow/stopped approachers near the box are still rolled (they'd otherwise be
@@ -265,7 +339,7 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
         v_τ = clamp(v + a·τ, 0, V_PHYS); arc-length integrates that profile.  [n,K,2]."""
         v_prof = (v[idxs].unsqueeze(1) + a_belief.unsqueeze(1) * t).clamp(0.0, V_PHYS)
         s_t    = (s[idxs] - L_VEH / 2.0).unsqueeze(1) + torch.cumsum(v_prof * DT_2D, dim=1)
-        return _rollout_xy(geo, mv[idxs], s_t)                  # [n,K,2]
+        return _rollout_xy(geo, mv[idxs], s_t, geo_order)      # [n,K,2]
 
     # GREEDY ORDER: earliest arrival decides first.  d_to_junc<0 (in-box) → eta<0 → front
     # of the queue (highest priority to clear).  Each vehicle then plans around the
@@ -273,14 +347,13 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
     eta   = d_to_junc / v.clamp(min=utils.EPS)
     order = [i for i in torch.argsort(eta).tolist() if bool(roll[i])]
 
-    axis_all = _AXIS[mv]                                        # travel axis per active vehicle
     a_corr = a.clone()
     committed: list = []                                        # egos already resolved this step (ETA order)
     # BOX EXCLUSIVITY: an axis is "claimed" while a vehicle occupies the box (or is past the
     # point of no return into it).  Seed with whoever is already inside; the ETA loop adds
     # claimers as they commit.  A crossing-axis vehicle that can STILL stop is halted at the
     # stop-line so two streams never co-occupy the box (the seed-3 low-speed pile-up).
-    occupied = {int(axis_all[j]) for j in range(len(s)) if bool(in_box[j])}
+    occupied = {int(mv[j]) for j in range(len(s)) if bool(in_box[j])}
     for i in order:
         is_y = bool(yielders[i])
         if bool(in_box[i]):
@@ -300,7 +373,7 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
             # CROSS axis, carrying its just-committed plan.  This is the missing guarantee — two
             # PASSERS (empty designated set) would otherwise both accelerate into each other.  By
             # deferring to whoever committed first, the earlier clears and the later brakes.
-            com = [j for j in committed if bool(axis_all[j] != axis_all[i])]
+            com = [j for j in committed if _cross(int(mv[j]), int(mv[i]))]
             com_xy = _roll(torch.tensor(com), a_corr[torch.tensor(com)]) if com else None
 
         ai = float(a_corr[i])
@@ -333,24 +406,26 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
         # while a vehicle occupies it; a crossing vehicle that can still AVOID entering (it is
         # stopped, or has room to brake before the line) is halted; otherwise the proceeding
         # vehicle reaching a FREE box claims its axis so the next crosser halts.
-        ax_i     = int(axis_all[i])
+        mv_i     = int(mv[i])
         d_entry  = float(s_junc[mv[i]] - s[i]) - utils.STOP_OFFSET   # front → stop-line
         d_need   = float(v[i]) ** 2 / (2.0 * utils.B_MAX)
         can_hold = (float(v[i]) < 0.5) or (d_entry > d_need + EPS_ENTRY)   # can avoid entering
-        cross_blocked = any(ax != ax_i for ax in occupied)
+        cross_blocked = box_exclusive and any(_cross(occ, mv_i) for occ in occupied)
         if bool(in_box[i]):
-            occupied.add(ax_i)                                  # in box → holds it while clearing
+            occupied.add(mv_i)                                  # in box → holds it while clearing
         elif cross_blocked and can_hold:
             # a crossing stream holds/has-reserved the box and this one can still avoid entering
             # → HALT.  Because the reservation is made EARLY (below), a faster crosser is told to
             #   stop while it still has the room — preventing two full-speed cars converging.
             a_stop = -(float(v[i]) ** 2) / (2.0 * max(d_entry, EPS_ENTRY))
             ai = max(min(ai, a_stop), -utils.B_MAX)
-        elif not is_y:
-            # proceeding (not yielding) and not blocked → RESERVE its axis now.  The loop is
-            # ETA-ordered, so the earliest-arriving stream reserves first and every later
-            # crossing vehicle this step sees it and halts in time (FCFS at the box by ETA).
-            occupied.add(ax_i)
+        elif (not is_y) and (d_entry / max(float(v[i]), EPS_ENTRY) < BOX_RESERVE_T):
+            # proceeding (not yielding), not blocked, and within BOX_RESERVE_T of entry →
+            # RESERVE its movement now.  The loop is ETA-ordered, so the earliest-arriving
+            # stream reserves first and every later conflicting vehicle this step sees it and
+            # halts in time (FCFS at the box by ETA).  Gating on time-to-entry keeps the
+            # reservation tight to actual occupancy instead of claimed seconds out.
+            occupied.add(mv_i)
 
         # ONLY a passer the gate forced to brake against a committed crosser is "deferring" —
         # latch THAT (the two-passer tiebreak).  A box-exclusivity halt is NOT latched, so the
@@ -363,7 +438,7 @@ def rollout_gate(a, s, v, mv, yield_mask, geo, s_junc, verbose=False, return_def
 
 
 def hinge_gradient_gate(a, feat, s, v, mv, geo, s_junc, delta_safe=None,
-                        n_steps=None, eta=None, da_max=None):
+                        n_steps=None, eta=None, da_max=None, conf=None, geo_order=None):
     """RKHS-smoothed projected-gradient polish that DIRECTLY minimizes the predicted
     2-D hinge, run as a refinement AFTER rollout_gate (role logic / box-exclusivity
     already applied to `a`).
@@ -400,9 +475,15 @@ def hinge_gradient_gate(a, feat, s, v, mv, geo, s_junc, delta_safe=None,
     if n < 2:
         return a
 
-    ax       = _AXIS[mv[idx]]
-    pairmask = (ax.unsqueeze(0) != ax.unsqueeze(1)) & torch.triu(
-        torch.ones(n, n, dtype=torch.bool), 1)                 # cross-axis, each pair once
+    # conflicting pairs in the window: true per-pair crossing when `conf` is supplied (turn
+    # geometry), else the straight axis proxy (different entry axis ⇔ paths cross).
+    mvw = mv[idx]
+    if conf is not None:
+        cross = conf[mvw][:, mvw]
+    else:
+        ax = _AXIS[mvw]
+        cross = ax.unsqueeze(0) != ax.unsqueeze(1)
+    pairmask = cross & torch.triu(torch.ones(n, n, dtype=torch.bool), 1)  # each pair once
     if not bool(pairmask.any()):
         return a
 
@@ -425,7 +506,7 @@ def hinge_gradient_gate(a, feat, s, v, mv, geo, s_junc, delta_safe=None,
         a_leaf = a_set.detach().requires_grad_(True)
         v_prof = (v_i.unsqueeze(1) + a_leaf.unsqueeze(1) * t).clamp(0.0, V_PHYS)   # [n,K]
         s_t    = (s_i - L_VEH / 2.0).unsqueeze(1) + torch.cumsum(v_prof * DT_2D, dim=1)  # [n,K]
-        xy     = _rollout_xy(geo, mv_i, s_t)                   # [n,K,2]
+        xy     = _rollout_xy(geo, mv_i, s_t, geo_order)        # [n,K,2]
         d      = (xy.unsqueeze(1) - xy.unsqueeze(0)).norm(dim=-1)   # [n,n,K]
         J      = (torch.relu(d_safe - d).pow(2) * pm).sum() * DT_2D
         if J_first is None:
@@ -485,7 +566,7 @@ def gen_events(flow, seed):
 
 def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
              events=None, gate2d=True, dt=DT, verbose=False, mean_model=None,
-             hinge_gate=HINGE_GATE):
+             hinge_gate=HINGE_GATE, f_log=None):
     DT_ = dt
     if geo is None:
         geo, s_cp, path_len, s_junc = build_geometry()
@@ -589,6 +670,22 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
             pred_override=pred_override, mean_fn=mean_fn)
         if gate2d:
             a, yield_mask, feat = out
+            # harvest (g, τ_c, r, f, Δa) at the ACTUAL operating φ* for the f-contour.
+            # f  = raw learned prior mean;  Δa = its NET effect on the command
+            # (with-mean − zero-mean), which is ~0 wherever the anchors pin the output.
+            if f_log is not None and mean_fn is not None:
+                with torch.no_grad():
+                    fvals = mean_fn(feat)                        # [Na] learned mean at φ*
+                    a_zero = utils.controller_acceleration(
+                        torch.zeros(Na), gap + L_VEH, v_a, v_lead,
+                        d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
+                        ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
+                        a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
+                        pred_override=pred_override, mean_fn=None)   # zero-mean command
+                    da = a.detach() - a_zero                     # f's net effect on accel
+                # [Na, 6] = g, τ_c, r, f, Δa, a_zero (the physics/zero-mean prescribed accel)
+                f_log.append(torch.cat([feat.detach(), fvals.detach().unsqueeze(-1),
+                                        da.unsqueeze(-1), a_zero.unsqueeze(-1)], dim=-1))
             if verbose and step % 20 == 0:
                 print(f"  t={t:5.1f}s  active={Na}")
             a = rollout_gate(a.detach(), s_a, v_a, mv_a, yield_mask, geo, s_junc,

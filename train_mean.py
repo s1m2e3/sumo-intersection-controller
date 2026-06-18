@@ -81,13 +81,24 @@ LAM_S    = 3.0                  # safety-hinge weight.  The hinge is the SMOOTH
                                 #  penalty is ~7.5× smaller than the old h², so λ_s is
                                 #  scaled up to keep a crash-level episode costing about
                                 #  its entire velocity integral.
-LAM_C    = 1e-3                 # effort (a²) weight
+LAM_V    = 0.0                  # throughput REMOVED from the objective — f is trained on safety
+                                #  (hinge) + acceleration (effort/jerk) ONLY; the base kernel
+                                #  still carries throughput, so f focuses purely on smooth safety
+LAM_C    = 0.0                  # effort (a²) weight — DISABLED: train f on the hinge ALONE so
+LAM_J    = 0.0                  # jerk weight — DISABLED.  No acceleration penalty competing with
+                                #  safety, so f is free to reduce conflicts without an effort cost
+                                #  suppressing it (still logged for monitoring; f stays tanh-bounded
+                                #  to ±F_LIM and the gate shields safety regardless)
 D_HINGE  = S.D_SAFE_2D          # hinge fires below the gate's own safety distance
 GRAD_CLIP = 2.0                 # clip the batch-averaged gradient to norm 2: with the
                                 #  saturating hinge the tail is already bounded by shape,
                                 #  so this binds rarely — but when a window does produce
                                 #  an outsized gradient, it enters Adam at norm ≤ 2
-CKPT     = "mean_net_ckpt.pt"
+CKPT      = mean_net.ckpt_path("best")   # BEST model by combined score (arch-tagged)
+LAST_CKPT = mean_net.ckpt_path("last")   # LATEST model — saved EVERY epoch (arch-tagged)
+LOG_CSV   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "train_log.csv")
+LOG_COLS  = ["epoch", "mean_J", "mean_hinge", "score", "arrived", "eff_a2", "jerk_da2",
+             "f_abs", "f_conflict", "f_free", "f_max", "dtheta", "updates"]
 
 # mid-cell probe points (g, τ_c, r) — far from anchors, where f has authority; the
 # mean |f| over these is printed per epoch to show whether the function is moving
@@ -95,10 +106,16 @@ F_PROBE  = torch.tensor([[0.6, 2.5, 0.0], [0.6, 2.5, 1.0],
                          [1.6, 1.2, 0.0], [1.6, 1.2, 1.0],
                          [2.7, 6.2, 1.0]])
 
+# movement index → travel axis (0=x/EW, 1=y/NS) and direction sign (±1), for the
+# conflicting-approach densities build_context needs
+AX_MV = torch.tensor([C.ORIGIN[m][0] for m in C._MOVES])
+SG_MV = torch.tensor([C.ORIGIN[m][1] for m in C._MOVES])
+
 # ── initial-condition pool: realized SUMO departures, collected once ────────────
-IC_FLOWS = (300, 400, 500)
-IC_SEEDS = tuple(range(16))     # 16 seeds per flow → 48 scenarios in the pool
-IC_CACHE = "_ic_pool.pt"
+IC_FLOWS = (500, 600, 700)      # train across the saturation range (was 500 only) so f
+                                # generalizes to the high-demand densities it under-served
+IC_SEEDS = tuple(range(16))     # 16 seeds → 16 scenarios in the pool
+IC_CACHE = f"_ic_pool_{'_'.join(map(str, IC_FLOWS))}.pt"   # flow-tagged ⇒ no stale reuse
 
 
 def collect_sumo_initial_conditions(flows=IC_FLOWS, seeds=IC_SEEDS):
@@ -184,7 +201,14 @@ class EpisodeStepper:
         # episode accumulators (floats, reporting only)
         self.loss_f = self.j_sum_f = self.hinge_f = self.eff_f = 0.0
         self.eff_n = self.arrived = 0
+        self.jerk_f = 0.0; self.jerk_n = 0          # mean (Δa)² over vehicles active 2 steps running
+        self.was_active = torch.zeros(self.Ntot, dtype=torch.bool)   # active last step? (skip fresh spawns)
         self.f_abs = 0.0; self.f_n = 0      # mean |f| at the mid-cell probe points
+        # |f| at the ACTUAL operating φ*, split by whether the ego has a cross rival —
+        # answers "is f ~0 everywhere, or ~0 in free-flow but ACTIVE when a conflict exists?"
+        self.fc_sum = 0.0; self.fc_n = 0    # Σ|f| over conflict vehicle-steps (valid rival)
+        self.ff_sum = 0.0; self.ff_n = 0    # Σ|f| over free-flow vehicle-steps
+        self.f_max  = 0.0                   # running max |f| at an actual operating point
 
     def done(self):
         return self.step_i >= self.n_steps
@@ -284,20 +308,31 @@ class EpisodeStepper:
                     prop, t)
 
                 ctx = mean_net.build_context(v_a, gap, v_lead, P, behind_n, d_junc,
-                                             ego_d, rival_d, valid, roles)
+                                             ego_d, rival_d, valid, roles,
+                                             AX_MV[mv_a], SG_MV[mv_a])
                 mean_fn = model.make_mean_fn(model.encode(*ctx))
                 with torch.no_grad():       # diagnostic only: |f| at mid-cell probes
                     fp = mean_fn(F_PROBE.unsqueeze(0).expand(Na, -1, -1))
                     self.f_abs += float(fp.abs().mean()); self.f_n += 1
 
                 # steps 1–3: conditional mean (gradient lives here)
-                a_gp, yield_mask = utils.controller_acceleration(
+                a_gp, yield_mask, feat = utils.controller_acceleration(
                     torch.zeros(Na), gap + L_VEH, v_a, v_lead,
                     d_conf=ego_d, rival_d=rival_d, rival_v=rival_v,
                     rival_valid=valid, ego_pressure=P,
                     rival_pressure=P.unsqueeze(0).expand(Na, Na),
                     a_prev=self.prev_a[act], kappa=0.5, brake_exempt=True,
-                    return_roles=True, pred_override=pred_override, mean_fn=mean_fn)
+                    return_roles=True, return_feat=True,
+                    pred_override=pred_override, mean_fn=mean_fn)
+
+                with torch.no_grad():       # |f| at the ACTUAL operating φ*, split conflict/free
+                    f_act = mean_fn(feat).abs()                  # [Na]
+                    conflict = valid.any(dim=1)                  # ego has a valid cross rival
+                    if bool(conflict.any()):
+                        self.fc_sum += float(f_act[conflict].sum()); self.fc_n += int(conflict.sum())
+                    if bool((~conflict).any()):
+                        self.ff_sum += float(f_act[~conflict].sum()); self.ff_n += int((~conflict).sum())
+                    self.f_max = max(self.f_max, float(f_act.max()))
 
                 # step 4: gate, straight-through, with defer feedback, force-rolled
                 # protected passers, and POST-GATE liveness — identical to cosim
@@ -331,13 +366,9 @@ class EpisodeStepper:
                 near = (d_junc.detach() > -S.JCT_PAST) & (d_junc.detach() < 60.0)
                 if int(near.sum()) >= 2:
                     ni = near.nonzero().flatten()
-                    xy = torch.zeros(len(ni), 2)
-                    for mi in range(4):
-                        selm = (mv_a[ni] == mi).nonzero().flatten()
-                        if len(selm):
-                            pts, cum = self.geo[C._MOVES[mi]]
-                            xy[selm], _ = S._interp(pts, cum,
-                                                    s_new[ni][selm] - L_VEH / 2.0)
+                    # batched interpolation of all near-junction centres at once
+                    xy, _ = S._interp_batch(*S.pad_geometry(self.geo),
+                                            mv_a[ni], s_new[ni] - L_VEH / 2.0)
                     cross = (ax_a[ni].unsqueeze(0) != ax_a[ni].unsqueeze(1))
                     cross = cross & torch.triu(torch.ones_like(cross), 1)
                     if bool(cross.any()):
@@ -348,18 +379,28 @@ class EpisodeStepper:
                         h = F_t.relu(D_HINGE - dist[cross])
                         hinge = (h ** 2 / (1.0 + h)).sum()
                 eff = (a_gp ** 2).mean()
+                # JERK / smoothness: (Δa)² vs the previous step's applied accel, ONLY for
+                # vehicles active in both steps (self.prev_a still holds last step's a here;
+                # fresh spawns excluded so the 0→a₀ insertion jump isn't penalized).
+                seen = self.was_active[act]
+                if bool(seen.any()):
+                    jerk = ((a - self.prev_a[act])[seen] ** 2).mean()
+                else:
+                    jerk = torch.zeros(())
 
                 # hinge enters as a TIME INTEGRAL (×DT) so its scale — and λ_s's
                 # sizing against the SUMO probe sweep — is independent of the step
-                loss_step = (-(j_step / (self.Ntot * self.plm))
+                loss_step = (-LAM_V * (j_step / (self.Ntot * self.plm))
                              + LAM_S * hinge * DT / self.Ntot
-                             + LAM_C * eff / self.n_steps)
+                             + LAM_C * eff / self.n_steps
+                             + LAM_J * jerk / self.n_steps)
                 if not warm:
                     loss_win = loss_win + loss_step
                 self.loss_f  += float(loss_step)
                 self.j_sum_f += float(j_step)
                 self.hinge_f += float(hinge) * DT
                 self.eff_f   += float(eff); self.eff_n += 1
+                self.jerk_f  += float(jerk); self.jerk_n += 1
                 w_j     += float(j_step)
                 w_hinge += float(hinge) * DT
 
@@ -367,6 +408,8 @@ class EpisodeStepper:
                 self.s = self.s.clone(); self.s[act] = s_new
                 self.v = self.v.clone(); self.v[act] = v_new
                 self.prev_a = self.prev_a.clone(); self.prev_a[act] = a
+                self.was_active = torch.zeros(self.Ntot, dtype=torch.bool)
+                self.was_active[act] = True          # for next step's jerk mask
 
             done_v = act[self.s[act] >= self.path_len[mv_a]]
             self.state[done_v] = 2
@@ -401,7 +444,7 @@ def main():
     pool = collect_sumo_initial_conditions()
     geo, s_cp, path_len, s_junc = S.build_geometry()
     jgeo = junction_geometry(geo)
-    model = mean_net.MeanTransformer()
+    model = mean_net.make_mean_model()
     best_score = -1e9
     if os.path.exists(CKPT) and not fresh:
         ck = torch.load(CKPT, weights_only=True)
@@ -422,6 +465,16 @@ def main():
     # The hot lr is SAFE here: f is tanh-bounded, anchor-pinned, and double-shielded —
     # a bad f gets corrected, it cannot crash anything.
     opt   = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.95))
+    # GENTLE cosine anneal — decays slowly to 0.3·lr over the whole run (not a fast drop),
+    # so late epochs fine-tune without the hot-lr overshoot that saturated the last attempt
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1),
+                                                       eta_min=lr * 0.3)
+
+    # per-epoch metric log → outputs/train_log.csv (fresh run truncates; resume appends)
+    os.makedirs(os.path.dirname(LOG_CSV), exist_ok=True)
+    if fresh or not os.path.exists(LOG_CSV):
+        with open(LOG_CSV, "w") as fcsv:
+            fcsv.write(",".join(LOG_COLS) + "\n")
 
     n_windows = int(T_END / WINDOW_S)
     print(f"\ntraining: {epochs} epochs × batch {batch} (pool {len(pool)} SUMO scenarios), "
@@ -454,6 +507,14 @@ def main():
             for p in model.parameters():
                 if p.grad is not None:
                     p.grad /= B
+            # SKIP the step on a non-finite (inf/nan) gradient — clipping by an inf/nan
+            # norm would poison the weights; just drop this window and move on
+            finite = all(torch.isfinite(p.grad).all() for p in model.parameters()
+                         if p.grad is not None)
+            if not finite:
+                opt.zero_grad(set_to_none=True)
+                print(f"    [epoch {ep_i:3d}] window {w}: non-finite gradient — step SKIPPED")
+                continue
             gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP))
             opt.step(); n_upd += 1
             print(f"    [epoch {ep_i:3d}] update {n_upd:2d}  t={w*WINDOW_S:3.0f}-"
@@ -461,31 +522,49 @@ def main():
                   f"hinge={w_hinge/B:6.2f}  |grad|={gnorm:.3f}  ({time.time()-tw:.1f}s)")
 
         ep_j, ep_hinge, ep_arr, ep_f, ep_score = 0.0, 0.0, 0, 0.0, 0.0
+        fc_sum = fc_n = ff_sum = ff_n = 0; f_max = 0.0; ep_eff = ep_jerk = 0.0
         for sc, st in zip(scenarios, steppers):
             j = st.j_norm()
-            # combined selection score, SAME sign convention as the loss:
-            # maximize J̄ − λ_s·(hinge integral)/N — fast AND clean, never one alone
-            score = j - LAM_S * st.hinge_f / st.Ntot
+            # throughput is OUT of the objective: select on safety + smoothness only.
+            # score = −(λ_s·hinge/N + λ_c·⟨a²⟩ + λ_j·⟨Δa²⟩); higher (less negative) = better
+            score = -(LAM_S * st.hinge_f / st.Ntot
+                      + LAM_C * st.eff_f / max(st.eff_n, 1)
+                      + LAM_J * st.jerk_f / max(st.jerk_n, 1))
             print(f"    [epoch {ep_i:3d}] episode  flow={sc['flow']} "
                   f"seed={sc['seed']:2d}  J̄={j:.4f}  hinge={st.hinge_f:7.2f}  "
                   f"score={score:+.4f}  arrived={st.arrived}")
             ep_j += j; ep_hinge += st.hinge_f; ep_arr += st.arrived
             ep_f += st.f_abs / max(st.f_n, 1); ep_score += score
+            fc_sum += st.fc_sum; fc_n += st.fc_n; ff_sum += st.ff_sum; ff_n += st.ff_n
+            f_max = max(f_max, st.f_max)
+            ep_eff += st.eff_f / max(st.eff_n, 1); ep_jerk += st.jerk_f / max(st.jerk_n, 1)
         ep_j /= B; ep_score /= B
         theta1 = torch.cat([p.detach().flatten() for p in model.parameters()])
         dtheta = float((theta1 - theta0).norm())
         print(f"  epoch {ep_i:3d}  mean_J̄={ep_j:.4f}  mean_hinge={ep_hinge/B:7.2f}  "
               f"score={ep_score:+.4f}  arrived={ep_arr}  updates={n_upd}  "
-              f"⟨|f|⟩={ep_f/B:.4f} m/s²  ‖Δθ‖={dtheta:.4f}  ({time.time()-t0:.1f}s)\n")
+              f"⟨|f|⟩={ep_f/B:.4f} m/s²  ‖Δθ‖={dtheta:.4f}  ({time.time()-t0:.1f}s)")
+        print(f"          |f| at ACTUAL φ*:  conflict={fc_sum/max(fc_n,1):.4f}  "
+              f"free={ff_sum/max(ff_n,1):.4f}  max={f_max:.4f} m/s²  "
+              f"(conflict steps {fc_n}/{fc_n+ff_n})")
+        print(f"          smoothness:  mean a²={ep_eff/B:.4f}  mean (Δa)²={ep_jerk/B:.4f}"
+              f"  (λ_c={LAM_C}, λ_j={LAM_J} — want these to DROP as f learns to smooth)\n")
+        with open(LOG_CSV, "a") as fcsv:    # one row per epoch → plot_train.py renders curves
+            row = [ep_i, ep_j, ep_hinge / B, ep_score, ep_arr, ep_eff / B, ep_jerk / B,
+                   ep_f / B, fc_sum / max(fc_n, 1), ff_sum / max(ff_n, 1), f_max, dtheta, n_upd]
+            fcsv.write(",".join(f"{x:.6g}" for x in row) + "\n")
 
-        # the checkpoint is always the BEST model by the COMBINED score
-        # (J̄ − λ_s·hinge/N, carried across runs)
+        # LATEST: save every epoch (where training currently is, regardless of score)
+        torch.save({"state_dict": model.state_dict(), "score": ep_score,
+                    "best_j": ep_j, "epoch": ep_i}, LAST_CKPT)
+        # BEST: only when the COMBINED score improves (J̄ − λ_s·hinge/N, carried across runs)
         if ep_score > best_score:
             best_score = ep_score
             torch.save({"state_dict": model.state_dict(), "best_score": best_score,
                         "best_j": ep_j}, CKPT)
             print(f"  ↳ new best score={best_score:+.4f} (J̄={ep_j:.4f}) — "
                   f"checkpoint saved to {CKPT}\n")
+        sched.step()                      # gentle per-epoch lr anneal
 
     print(f"done. best score={best_score:+.4f}  checkpoint (best): {CKPT}")
 
