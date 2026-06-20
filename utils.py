@@ -123,19 +123,34 @@ def _anchor_target(g: float, tc: float, r: float, p: float = 0.0):
             return 0.0                          # HOLD at the desired gap (stable equilibrium)
         return "free"                           # roll at free-flow up to the line
     if p >= 0.5:
-        # PROMOTION: the vehicle PASSES — the cross-conflict yield is dropped — but it
-        # still keeps longitudinal safety: no gap (g<1) ⇒ it cannot push (brakes).
+        # PROMOTION: the role r is the LATCHED passer/yielder decided AMONG the promoted set
+        # (run_turns sorts by ETA and FORCES every in-box must-clear vehicle to PASS).  The
+        # cross-conflict is resolved only within that group — never against held/anti-promoted
+        # traffic.  Longitudinal safety is always kept: no gap (g<1) ⇒ it cannot push (brakes).
         if g < 1.0:
             return "brake"                      # no gap → can't push (rear-end safety kept)
-        if tc == 0.0:
-            return "clear"                      # assert through the conflict point (a_max)
-        if g == 1.0:
-            return 0.0                          # HOLD at the desired gap — STABLE equilibrium.
+        if r >= 0.5:
+            # PROMOTED PASSER — asserts through, IGNORING cross timing τ_c (it holds right-of-way
+            # within the promoted group; its only constraint is the g<1 rear-end floor).
+            if tc == 0.0:
+                return "clear"                  # assert through the conflict point (a_max)
+            if g == 1.0:
+                return 0.0                      # HOLD at the desired gap — STABLE equilibrium.
                                                 # Without this the promoted column jumps brake(g<1)
                                                 # ↔ free(g≥1) with no fixed point, so a follower
                                                 # limit-cycles (gas/brake/gas/brake). Mirrors the
                                                 # normal column's g==1 HOLD anchor.
-        return "free"                           # g≥2 (room ahead) → free-flow, IGNORE cross timing τ_c
+            return "free"                       # g≥2 (room ahead) → free-flow
+        # PROMOTED YIELDER — latched behind an earlier promoted vehicle (typically an in-box
+        # must-clear passer it conflicts with): brake to arrive δ_safe behind it (a_cross), then
+        # HOLD once the margin opens.  Same shape as the normal yielder, but its rival set is the
+        # promoted subset only.  The latch releases (→ passer) once that vehicle clears its LAST
+        # conflict point, so the queue serializes through behind it rather than deadlocking.
+        if tc == 0.0:
+            return "yield"                      # at the conflict line, no margin → brake to it
+        if g == 1.0:
+            return 0.0                          # HOLD at the desired gap
+        return 0.0 if tc + 1e-9 >= DELTA_SAFE else "yield"
     # p == 0 → normal behavior (unchanged)
     if g < 1.0:
         return "brake"                          # longitudinal safety dominates for both roles
@@ -321,7 +336,8 @@ def cross_resolve_accel(d_ego, v_ego, eta_rival, delta, delta_safe=DELTA_SAFE,
 
 def resolve_cross_accel(ego_d, v_ego, rival_d, rival_v, rival_valid,
                         delta_safe=DELTA_SAFE, a_max=A_MAX, b_max=B_MAX,
-                        prio_ego=None, prio_rival=None):
+                        prio_ego=None, prio_rival=None,
+                        earlier_override=None, override_mask=None):
     """
     η-ORDERING / FCFS multi-rival resolver (Flaw-1 fix).  Priority is arrival time at
     each pair's conflict point: the EARLIER vehicle has right-of-way.
@@ -363,6 +379,13 @@ def resolve_cross_accel(ego_d, v_ego, rival_d, rival_v, rival_valid,
     eta_e_cmp = eta_e if prio_ego   is None else eta_e - prio_ego
     eta_k_cmp = eta_k if prio_rival is None else eta_k - prio_rival
     earlier    = rival_valid & (eta_k_cmp < eta_e_cmp)         # rivals with right-of-way
+    if earlier_override is not None:
+        # LATCHED right-of-way (promotion): for egos flagged in override_mask, REPLACE the live
+        # ETA ordering with the latched who-yields-to-whom decision.  rival_valid still gates it,
+        # so a rival that has physically cleared the pair drops out automatically.  This freezes
+        # the promoted set's pass/yield assignment so it can't flap step-to-step.
+        om = override_mask.unsqueeze(-1)                       # [..., 1]
+        earlier = torch.where(om, rival_valid & earlier_override, earlier)
     must_yield = earlier.any(dim=-1)                           # [...]
     any_rival  = rival_valid.any(dim=-1)                       # [...]
 
@@ -573,6 +596,8 @@ def controller_acceleration(
     pred_override=None,
     promote=None,                       # [...] per-vehicle promotion flag p∈{-1,0,1} (None ⇒ all 0)
     prio_ego=None, prio_rival=None,     # optional right-of-way priority bias (s), non-predecessor mode
+    cross_override=None,                # (earlier_override[...,K], override_mask[...]) latched who-yields
+                                        #   (non-predecessor mode) — promotion's frozen ETA assignment
     return_roles=False,
     return_feat=False,
     mean_fn=None,
@@ -637,9 +662,11 @@ def controller_acceleration(
     else:
         tau_c, delta_w, eta_w, any_rival, ego_d_sel, v_rival_sel = conflict_time_gap(
             d_conf, v_ego, rival_d, rival_v, rival_valid)
+        _eov, _omask = (cross_override if cross_override is not None else (None, None))
         a_cross, must_yield = resolve_cross_accel(
             d_conf, v_ego, rival_d, rival_v, rival_valid, delta_safe=DELTA_SAFE,
-            prio_ego=prio_ego, prio_rival=prio_rival)
+            prio_ego=prio_ego, prio_rival=prio_rival,
+            earlier_override=_eov, override_mask=_omask)
         eta_pred, ego_d_pred, v_pred, has_pred, any_cross = (
             eta_w, ego_d_sel, v_rival_sel, must_yield, any_rival)
 

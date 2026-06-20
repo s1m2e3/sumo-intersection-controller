@@ -160,6 +160,8 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
                                              # N_PROMOTE-th front seed-lane vehicle (longer window ⇒ more
                                              # of the clique clears per phase; not a cap on who is promoted)
     phase_mvs, phase_end = [], -1.0          # LATCHED promotion (only active during starvation)
+    prom_yield = {}                          # veh_id → set of veh_ids it is LATCHED to yield to
+                                             # (promotion pass/yield assignment; released per final_cp)
     arrived, collided = [], set()
     from collections import defaultdict
     DIRNAME = {m.idx: m.dir for m in mv}
@@ -199,10 +201,12 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
 
         # leader gap / speed (longitudinal) via SUMO
         gap = torch.full((N,), 300.0); v_lead = vs.clone()
+        leader_id = [None] * N                            # physical leader veh-id on the ego's route
         for i, v in enumerate(vehs):
             ld = traci.vehicle.getLeader(v, 100.0)
             if ld and ld[0] in mv_idx:
                 gap[i] = max(ld[1], 0.0)
+                leader_id[i] = ld[0]
                 if ld[0] in sub: v_lead[i] = sub[ld[0]][tc.VAR_SPEED]
 
         # SUPPLEMENT the route-based getLeader with a same-approach, same-LANE in-lane leader.
@@ -225,6 +229,25 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
                 dg = float(s_front[j]) - float(s_front[i]) - utils.L_VEH   # bumper gap (j ahead ⇒ >0)
                 if 0.0 <= dg < float(gap[i]):
                     gap[i] = dg; v_lead[i] = float(vs[j])
+
+        # ── gap-belief trace (rear-end diagnostic): for a TRACE_MV near the box, print the vehicle's
+        # computed gap, leader speed, gap-ratio g and the raw getLeader — to see whether its OWN belief
+        # of the gap is wrong (huge while a leader is close) or correct.  OFF unless enabled via the CLI
+        # 'gaptrace=<mv>' flag (optionally 'gtwin=<t0>,<t1>' for the time window; default 74–83 s).
+        TRACE_MV = globals().get("_TRACE_MV", -1)
+        TRACE_T0, TRACE_T1 = globals().get("_TRACE_T0", 74.0), globals().get("_TRACE_T1", 83.0)
+        _tt = step * DT
+        if TRACE_MV >= 0 and TRACE_T0 <= _tt <= TRACE_T1:
+            for i in range(N):
+                if int(mvi[i]) == TRACE_MV and -52.0 < float(d_junc[i]) < 25.0:
+                    _ld = traci.vehicle.getLeader(vehs[i], 100.0)
+                    _g = float(utils.gap_ratio(torch.zeros(1),
+                                               torch.tensor([float(gap[i]) + utils.L_VEH]),
+                                               torch.tensor([float(vs[i])]),
+                                               torch.tensor([float(v_lead[i])]), utils.L_VEH)[0])
+                    print(f"  [gaptrace t={_tt:5.1f}] {vehs[i]:>6} d_junc={float(d_junc[i]):7.1f} "
+                          f"v={float(vs[i]):5.2f} gap={float(gap[i]):6.1f} vlead={float(v_lead[i]):5.2f} "
+                          f"g={_g:5.2f}  getLeader={_ld}")
 
         # ARC-LENGTH per-pair conflict geometry from the conflict-point arc-lengths s_cp
         # (correct for curved turn paths — not an entry-axis projection).  ego_d[a,b] =
@@ -334,11 +357,12 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
         if t < phase_end and phase_mvs:
             for i in range(N):
                 mv_i = int(mvi[i])
-                if (mv_i in phase_mvs) or on_box[i]:              # (1) queue  ∪  (2) must-clear
-                    promoted[i] = True                           # p=0 ⇒ γ evaluated among promoted
-                    _DBG["promo_mv"][mv_i] += 1
+                if (mv_i in phase_mvs) or on_box[i]:              # (1) queue  ∪  (2) must-clear (in-box)
+                    promoted[i] = True
+                    promote[i] = 1.0                             # p=+1 PROMOTED: pass/yield decided AMONG
+                    _DBG["promo_mv"][mv_i] += 1                  #   the promoted set (latched, below)
                 else:
-                    promote[i] = -1.0                            # incompatible approacher → held at line
+                    promote[i] = -1.0                            # p=-1 incompatible → free-flow to line, held
                     _DBG["anti_mv"][mv_i] += 1
         is_yield = yield_eta.any(1) & (~promoted)              # for GUI coloring
 
@@ -360,8 +384,52 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
         valid_k = valid.clone()
         if bool(promoted.any()):
             valid_k[promoted] = valid[promoted] & promoted.unsqueeze(0)
-        # the KERNEL resolves everything: p=0 → ETA cross negotiation (here restricted to the
-        # promoted subset for promoted egos) + δ_safe brake + g<1 floor; p=-1 → free-flow to line.
+
+        # ── PROMOTION ROLE LATCH (pass/yield AMONG the promoted set).  Each promoted vehicle gets a
+        # strict PRIORITY RANK: in-box must-clear vehicles outrank the whole approaching queue (huge
+        # head-start), ties broken by ETA to the box.  Ego i is latched to YIELD to a CONFLICTING
+        # promoted rival j iff j OUTRANKS i — a strict total order, so of any conflicting pair exactly
+        # one yields (no mutual-pass crash, no mutual-yield deadlock).  In-box vs in-box therefore
+        # serialises by ETA instead of both asserting.  The base is recomputed each step (so a car that
+        # enters the box LATER is picked up), and a yield is LATCHED — held until that rival clears its
+        # LAST conflict point (s_front > final_cp), then released so the queue serialises through behind
+        # it.  earlier_ov[i,j]=True ⇒ i yields to j; fed to the kernel as the who-yields override.
+        prom_ids = {vehs[i] for i in range(N) if bool(promoted[i])}
+        for vid in list(prom_yield):                              # forget vehicles no longer promoted
+            if vid not in prom_ids:
+                del prom_yield[vid]
+        idx_of = {vehs[i]: i for i in range(N)}
+        on_box_t = torch.tensor(on_box)
+        eta_box  = d_junc / vs.clamp(min=utils.EPS)               # ETA to the stop-line (in-box ≤ 0)
+        rank     = torch.where(on_box_t, eta_box - 1e6, eta_box)  # in-box vehicles get right-of-way
+        earlier_ov = torch.zeros(N, N, dtype=torch.bool)
+        for i in sorted(range(N), key=lambda k: float(rank[k])):  # highest priority first
+            if not bool(promoted[i]):
+                continue
+            latched = prom_yield.setdefault(vehs[i], set())
+            for rv in list(latched):                              # RELEASE: rival cleared its last CP,
+                j = idx_of.get(rv)                                # left, OR is now BEHIND us (we lead it —
+                if (j is None or float(s_front[j]) > float(final_cp[int(mvi[j])])
+                        or leader_id[j] == vehs[i]):              # a stale merge yield would deadlock).
+                    latched.discard(rv)
+            for j in range(N):                                    # ADD current higher-rank conflictors
+                if j == i or not bool(promoted[j]) or not bool(valid_k[i, j]):
+                    continue
+                # never cross-yield to a vehicle we physically LEAD — that is a car-following
+                # relationship (its g<1 brake handles it), and yielding to our own follower at a
+                # merge is the f9.7↔f8.8 deadlock.
+                if leader_id[j] == vehs[i]:
+                    continue
+                if float(rank[j]) < float(rank[i]) and vehs[i] not in prom_yield.get(vehs[j], ()):
+                    latched.add(vehs[j])
+            for rv in latched:
+                j = idx_of.get(rv)
+                if j is not None:
+                    earlier_ov[i, j] = True
+
+        # the KERNEL resolves everything: p=+1 → pass/yield from the LATCHED who-yields override
+        # (rivals masked to the promoted subset) + δ_safe brake + g<1 floor; p=-1 → free-flow to
+        # the line; p=0 → live ETA cross negotiation against all rivals.
         c_out = utils.controller_acceleration(
             torch.zeros(N), gap + utils.L_VEH, vs, v_lead,
             d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid_k,
@@ -369,6 +437,7 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
             a_prev=a_prev_t, kappa=0.5, brake_exempt=True,
             brake_floor=True, predecessor=False, promote=promote, mean_fn=mean_fn,
             prio_ego=prio.unsqueeze(1), prio_rival=prio.unsqueeze(0),
+            cross_override=(earlier_ov, promoted),
             return_feat=use_proxy)
         # feat = [N,4] live query features (g, τ_c, r, p) — the proxy builds the
         # controller's own ARD Gram K^φ over them to smooth its hinge step.
@@ -501,6 +570,23 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
                         d_entry = float(s_junc_g[mvi[i]] - s_front[i]) - utils.STOP_OFFSET
                         box_cap[i] = (2.0 * utils.B_MAX * max(d_entry, 0.0)) ** 0.5
 
+        # ── TARGETED TRACE: follow specific vehicle ids over a time window — full state, the
+        # raw getLeader, who it is latched to yield to (and that rival's state).  Diagnostic only.
+        _TRACK = globals().get("_TRACK_IDS", [])
+        if _TRACK and 80.0 <= t <= 100.0:
+            for i in range(N):
+                if vehs[i] not in _TRACK:
+                    continue
+                ld = traci.vehicle.getLeader(vehs[i], 120.0)
+                yld = prom_yield.get(vehs[i], set())
+                ystr = ",".join(f"{rv}@{float(s_front[idx_of[rv]]):.1f}/cp{float(final_cp[int(mvi[idx_of[rv]])]):.1f}"
+                                for rv in yld if rv in idx_of) or "-"
+                print(f"  [trk t={t:5.1f}] {vehs[i]:>6} {DIRNAME[int(mvi[i])]:>3} d_junc={float(d_junc[i]):6.1f} "
+                      f"v={float(vs[i]):5.2f} a_ker={float(_a_kernel[i]):6.2f} a_fin={float(a[i]):6.2f} "
+                      f"gap={float(gap[i]):6.1f} tau_c={float(tau_c_all[i]):5.2f} inbox={int(on_box[i])} "
+                      f"acap={float(anti_cap[i]):6.1f} bcap={float(box_cap[i]):6.1f} "
+                      f"getLeader={ld} yields_to=[{ystr}]")
+
         for i, v in enumerate(vehs):
             prev_a[v] = float(a[i])
             if bool(held[i]):                                # brake to a stop at the meter line
@@ -539,7 +625,7 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
             print(f"\n=== STATE @ t={t:.1f}s  (N={N}) — near-box vehicles ===")
             print(f"{'veh':>7} {'dir':>3} {'role':>5} {'d_junc':>7} {'v':>5} "
                   f"{'a_ker':>6} {'a_gate':>6} {'a_fin':>6} {'cap':>6} {'gap':>6} {'tau_c':>6} "
-                  f"{'nyld':>4} {'prom':>4} {'dfr':>3} {'held':>4} {'inbox':>5}")
+                  f"{'nyld':>4} {'prom':>4} {'pyld':>4} {'dfr':>3} {'held':>4} {'inbox':>5}")
             order = sorted(range(N), key=lambda i: float(d_junc[i]))
             for i in order:
                 if not (-10.0 < float(d_junc[i]) < 80.0):
@@ -553,7 +639,8 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
                       f"{float(d_junc[i]):>7.1f} {float(vs[i]):>5.2f} "
                       f"{float(_a_kernel[i]):>6.2f} {float(_a_gate[i]):>6.2f} {float(a[i]):>6.2f} "
                       f"{cap_s} {float(gap[i]):>6.1f} {float(tau_c_all[i]):>6.2f} {int(ny[i]):>4} "
-                      f"{int(bool(promoted[i])):>4} {int(bool(_defer[i])):>3} "
+                      f"{int(bool(promoted[i])):>4} {len(prom_yield.get(vehs[i], ())):>4} "
+                      f"{int(bool(_defer[i])):>3} "
                       f"{int(bool(held[i])):>4} {int(on_box[i]):>5}")
 
         _DBG["promoted_steps"] += int(promoted.sum())
@@ -633,6 +720,17 @@ if __name__ == "__main__":
     kernel_ds = float(kds.split("=", 1)[1]) if kds is not None else None
     proxy_ds = _tok("proxy=", 5.0)
     dump_t = next((float(t.split("=", 1)[1]) for t in tokens if t.startswith("dump=")), None)
+    _trk = next((t for t in tokens if t.startswith("track=")), None)
+    if _trk is not None:
+        globals()["_TRACK_IDS"] = _trk.split("=", 1)[1].split(",")
+    # gap-belief trace: gaptrace=<movement-idx>  (optional window  gtwin=<t0>,<t1>)
+    _gt = next((t for t in tokens if t.startswith("gaptrace=")), None)
+    if _gt is not None:
+        globals()["_TRACE_MV"] = int(_gt.split("=", 1)[1])
+        _gw = next((t for t in tokens if t.startswith("gtwin=")), None)
+        if _gw is not None:
+            _t0, _t1 = _gw.split("=", 1)[1].split(",")
+            globals()["_TRACE_T0"], globals()["_TRACE_T1"] = float(_t0), float(_t1)
     # restrict to specific entry approaches: appr=east_in,west_in  (default: all four)
     at = next((t for t in tokens if t.startswith("appr=")), None)
     approaches = set(at.split("=", 1)[1].split(",")) if at is not None else None
