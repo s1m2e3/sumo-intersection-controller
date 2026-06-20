@@ -15,6 +15,7 @@ is the same "boxes overlap" test SUMO uses with collision.mingap-factor=0.
     conda run -n car-following-sumo python sim_torch.py [flow] [seed]
 """
 import os, sys, time
+from typing import NamedTuple
 import numpy as np
 import torch
 import sumolib
@@ -166,8 +167,9 @@ def collisions(xy, heading, length=L_VEH, width=W_VEH):
 
 
 # ── 2D constant-velocity rollout gate (replaces the 1D iterative correction) ────
-H_2D      = 4.0    # s    rollout horizon
-DT_2D     = 0.5    # s    rollout step
+H_2D      = 10.0   # s    rollout horizon (extended from 4 s so cross conflicts are seen
+                   #      ~2.5× earlier — anticipatory rather than reactive-at-the-box)
+DT_2D     = 0.5    # s    rollout step (held → K_2D = 20 steps)
 K_2D      = int(H_2D / DT_2D)
 D_SAFE_2D = 6.5    # m    centre-distance threshold: circumscribed circles ≈ 5.3 m
                    #      + ~1.2 m for the ≈5.5 m/sample sweep between rollout samples
@@ -547,6 +549,103 @@ def hinge_gradient_gate(a, feat, s, v, mv, geo, s_junc, delta_safe=None,
     return out
 
 
+def _arrival_time(d, v, a, vmax=V_PHYS, eps=1e-4):
+    """Accel-aware time to traverse arc-length d ≥ 0 under v(τ)=clamp(v+aτ, 0, vmax) —
+    the SAME constant-accel kinematics the 2-D rollout integrates, solved in closed form.
+
+    Returns (t, reaches).  reaches=False ⇒ a<0 brakes the vehicle to a halt before
+    covering d (it never arrives → not a conflict; caller masks it out).  Branches:
+      • cruise  (v≥vmax, a≥0):            t = d / vmax
+      • caps out (reaches vmax mid-way):  t = (vmax−v)/a + (d − d_acc)/vmax
+      • otherwise:                        t = 2d / (v + √(v²+2ad))   (= d/v as a→0)
+    The rationalized last form is stable at a→0 (no 0/0), matching the user's d/v exactly
+    when acceleration is zero, and is exact for any constant a in the unclamped regime."""
+    d = d.clamp(min=0.0); v = v.clamp(min=0.0)
+    disc    = v * v + 2.0 * a * d
+    reaches = disc > eps                                   # speed stays > 0 over [0, d]
+    sq      = torch.sqrt(disc.clamp(min=eps))              # speed at the crossing (unclamped)
+    t_uncl  = 2.0 * d / (v + sq).clamp(min=eps)
+    a_pos   = a.clamp(min=eps)
+    d_acc   = ((vmax * vmax - v * v) / (2.0 * a_pos)).clamp(min=0.0)   # dist to hit vmax
+    t_two   = (vmax - v).clamp(min=0.0) / a_pos + (d - d_acc).clamp(min=0.0) / vmax
+    over    = (sq > vmax) & (a > eps)
+    cruise  = (v >= vmax) & (a >= 0.0)
+    t = torch.where(cruise, d / vmax, torch.where(over, t_two, t_uncl))
+    return t, reaches
+
+
+def time_hinge_gradient_gate(a, feat, s, v, mv, s_cp, s_junc, delta_safe=None,
+                             n_steps=None, eta=None, da_max=None):
+    """TIME-domain analogue of hinge_gradient_gate.  Rather than penalizing 2-D spatial
+    proximity over a rollout, it penalizes the per-pair CONFLICT-TIME-GAP falling below
+    δ_safe — directly, in seconds, in the same units as the policy's δ_safe.
+
+        η_i  = accel-aware time for i to reach ITS specific (i,j) crossing point
+               (arc-length s_cp[mv_i, mv_j] − s_i, curvature-accurate — the via/internal
+               lane shape is baked into s_cp, NO straight-line approximation)
+        τ_c(i,j) = |η_i − η_j|
+        Ĵ(a) = Σ_{(i,j)∈C} [ ( δ_safe − τ_c(i,j) )₊ ]²
+
+    C = pairs whose paths genuinely cross (s_cp finite both ways), both still APPROACHING
+    their crossing (d > 0), and both actually REACHING it (neither brakes to a stop first
+    — a vehicle that stops short has yielded and is no conflict).  Projected RKHS-smoothed
+    gradient descent, identical machinery / hyperparameters to hinge_gradient_gate:
+
+        a ← Π_[−B_MAX, A_MAX]( a − η · K^φ ∇_a Ĵ ).
+
+    s_cp is the [M,M] per-pair conflict-point arc-length from build_geometry (s_cp[i,j] =
+    arc-length along movement i's path to its true geometric crossing with movement j)."""
+    n_steps = N_HINGE_STEPS if n_steps is None else n_steps
+    eta     = HINGE_ETA     if eta     is None else eta
+    da_max  = HINGE_DA_MAX  if da_max  is None else da_max
+    ds      = utils.DELTA_SAFE if delta_safe is None else delta_safe
+    d_to_junc = s_junc[mv] - s
+    reach   = (v * H_2D + D_SAFE_2D).clamp(min=JCT_AHEAD)
+    near    = (d_to_junc <= reach) & (d_to_junc >= -JCT_PAST)
+    idx     = near.nonzero().flatten()
+    n = len(idx)
+    if n < 2:
+        return a
+
+    mvw, s_w, v_w = mv[idx], s[idx], v[idx]
+    scp_e = s_cp[mvw][:, mvw]                       # [n,n] ego i's arc-len to (i,j) crossing
+    scp_r = s_cp.t()[mvw][:, mvw]                   # [n,n] rival j's arc-len to same crossing
+    finite = ~torch.isnan(scp_e) & ~torch.isnan(scp_r)         # paths actually cross
+    d_i = scp_e - s_w.unsqueeze(1)                  # ego remaining distance, per pair
+    d_j = scp_r - s_w.unsqueeze(0)                  # rival remaining distance, per pair
+    base = (finite & (d_i > 0.0) & (d_j > 0.0)
+            & torch.triu(torch.ones(n, n, dtype=torch.bool), 1))   # each crossing pair once
+    if not bool(base.any()):
+        return a
+    di = torch.nan_to_num(d_i, nan=0.0); dj = torch.nan_to_num(d_j, nan=0.0)
+
+    if HINGE_RKHS:
+        ls   = torch.tensor(utils.LENGTHSCALES, dtype=feat.dtype)
+        Kphi = utils._kernel_gram(feat[idx], ls)
+        if HINGE_RIDGE:
+            Kphi = Kphi + HINGE_RIDGE * torch.eye(n, dtype=Kphi.dtype)
+    else:
+        Kphi = torch.eye(n, dtype=a.dtype)
+
+    a_set = a[idx].clone()
+    for _ in range(n_steps):
+        a_leaf = a_set.detach().requires_grad_(True)
+        ti, ri = _arrival_time(di, v_w.unsqueeze(1), a_leaf.unsqueeze(1))   # ego (rows)
+        tj, rj = _arrival_time(dj, v_w.unsqueeze(0), a_leaf.unsqueeze(0))   # rival (cols)
+        tau_c  = (ti - tj).abs()                                   # [n,n] per-pair time gap
+        cm     = (base & ri & rj).to(a.dtype)                      # detached conflict gate
+        J      = (torch.relu(ds - tau_c).pow(2) * cm).sum()
+        if float(J) == 0.0:
+            break
+        grad, = torch.autograd.grad(J, a_leaf)
+        step  = (-eta * (Kphi @ grad)).clamp(-da_max, da_max)
+        a_set = (a_set + step).clamp(-utils.B_MAX, utils.A_MAX)
+
+    out = a.clone()
+    out[idx] = a_set
+    return out
+
+
 # ── simulation ──────────────────────────────────────────────────────────────────
 def gen_events(flow, seed):
     """Poisson arrival schedule: list of (depart_time, move_idx), sorted by time."""
@@ -564,14 +663,217 @@ def gen_events(flow, seed):
     return events
 
 
+def build_turn_geometry(net_path=NET_PATH):
+    """12-movement TURN geometry for the PyTorch sim — the SAME geometry run_turns feeds
+    to SUMO (turns_geom.gate_geometry).  Returns geo, s_cp, path_len, s_junc, conf,
+    geo_order; pass conf/geo_order into simulate() to switch it into turn mode."""
+    import turns_geom as G
+    geo, s_cp, s_junc, CONF = G.gate_geometry(net_path)
+    M = s_cp.shape[0]
+    path_len = torch.tensor([float(geo[i][1][-1]) for i in range(M)])
+    return geo, s_cp, path_len, s_junc, CONF, list(range(M))
+
+
+def gen_turn_events(vph, seed):
+    """Poisson schedule over the 12 turn movements at per-direction demand
+    vph={'l','s','r'} (vph/approach) — the PyTorch analogue of run_turns.write_turn_routes.
+    A direction with demand 0 emits no vehicles (so vph={'l':0,'s':N,'r':0} is straight)."""
+    import turns_geom as G
+    vph = vph or {"l": 100.0, "s": 300.0, "r": 100.0}
+    rng = np.random.default_rng(seed)
+    events = []
+    for m in G.movements(NET_PATH):
+        rate = float(vph[m.dir]) / 3600.0
+        if rate <= 0.0:
+            continue
+        t = 0.0
+        while True:
+            t += rng.exponential(1.0 / rate)
+            if t >= T_END:
+                break
+            events.append((t, m.idx))
+    events.sort()
+    return events
+
+
+def proxy_hinge_gate(a, s, v, mv, s_cp, s_junc, delta_safe=None, max_iters=200, step=0.1):
+    """GRADIENT-FREE proxy for the time hinge.  The exact FGD direction is unnecessary:
+    for any violating pair, accelerating the earlier vehicle and braking the later one is
+    ALWAYS a descent direction (η_lead↓, η_foll↑ ⇒ τ_c↑), so we apply a fixed ±`step`
+    in that direction and use the hinge only as a feasibility / continue-stop oracle.
+
+    GREEDY, LEADER-CENTRED, ITERATE-TO-FEASIBILITY (mirrors rollout_gate):
+      each iteration —
+        1. recompute every crossing pair's accel-aware τ_c (curvature-accurate s_cp);
+           if no pair violates τ_c < δ_safe → STOP (feasible)
+        2. LEADER = the earliest-ARRIVING vehicle among those in a violating pair
+        3. for each of the leader's violating conflicts, BRAKE whichever vehicle arrives
+           LATER at that crossing (−step).  That brakes the follower when the leader leads,
+           and brakes the LEADER ITSELF on a conflict where it is actually the later arriver
+           (a vehicle has two crossings — EW & WE — so the earliest-overall can still follow
+           at one of them; braking it there fixes that violation).
+        4. ACCELERATE the leader (+step) iff it is the earlier arriver in ALL its conflicts
+           and is neither LOCKED nor already braking (a<0 ⇒ an in-lane constraint the cross
+           view can't see).
+        5. then RE-SORT (next iteration recomputes τ_c and the leader)
+      LOCK: any vehicle once braked may only ever decelerate further — never be accelerated.
+      Braking is monotone-good (grows every gap) and terminal, acceleration is bounded by
+      A_MAX, so the process cannot livelock: it terminates at feasibility, or when every
+      vehicle involved is clamped (A_MAX / −B_MAX) and nothing can move.
+
+    No autograd, no kernel — pure functional."""
+    ds = utils.DELTA_SAFE if delta_safe is None else delta_safe
+    d_to_junc = s_junc[mv] - s
+    reach = (v * H_2D + D_SAFE_2D).clamp(min=JCT_AHEAD)
+    near  = (d_to_junc <= reach) & (d_to_junc >= -JCT_PAST)
+    idx   = near.nonzero().flatten()
+    n = len(idx)
+    if n < 2:
+        return a
+    mvw, s_w, v_w = mv[idx], s[idx], v[idx]
+    scp_e  = s_cp[mvw][:, mvw]                       # [n,n] ego i's arc-len to (i,j) crossing
+    scp_r  = s_cp.t()[mvw][:, mvw]                   # [n,n] rival j's arc-len to same crossing
+    finite = ~torch.isnan(scp_e) & ~torch.isnan(scp_r)
+    di = torch.nan_to_num(scp_e - s_w.unsqueeze(1), nan=-1.0)   # ego remaining, per pair
+    dj = torch.nan_to_num(scp_r - s_w.unsqueeze(0), nan=-1.0)   # rival remaining, per pair
+
+    a_set  = a[idx].clone()
+    braked = torch.zeros(n, dtype=torch.bool)        # LOCK: True ⇒ decel-only henceforth
+    BIG = 1e9
+    for _ in range(max_iters):
+        # per-pair accel-aware arrival times with the CURRENT command
+        ti, _ri = _arrival_time(di, v_w.unsqueeze(1), a_set.unsqueeze(1))   # [n,n] vehicle i → (i,j)
+        tj, _rj = _arrival_time(dj, v_w.unsqueeze(0), a_set.unsqueeze(0))   # [n,n] vehicle j → (i,j)
+        reach_i = di > 0.0; reach_j = dj > 0.0       # still approaching its crossing
+        valid = finite & reach_i & reach_j & _ri & _rj
+        valid.fill_diagonal_(False)
+        tau  = (ti - tj).abs()
+        viol = valid & (tau < ds)                    # [n,n] symmetric violating pairs
+        if not bool(viol.any()):
+            break                                    # FEASIBLE → done
+        # leader ranking key: each vehicle's soonest arrival among its violating conflicts
+        veh_arr = torch.where(viol, ti, torch.full_like(ti, BIG)).min(dim=1).values   # [n]
+        order = torch.argsort(veh_arr).tolist()      # earliest-arriving violator first
+
+        acted = False
+        for L in order:
+            js = viol[L].nonzero().flatten().tolist()
+            if not js:
+                continue
+            # per conflict: brake whichever vehicle arrives LATER (could be L itself)
+            laters = {(L if float(ti[L, j]) > float(tj[L, j]) else j) for j in js}
+            leads_all = L not in laters
+            can_accel = (leads_all and not bool(braked[L])
+                         and float(a_set[L]) >= 0.0 and float(a_set[L]) < utils.A_MAX - 1e-9)
+            can_brake = any(float(a_set[w]) > -utils.B_MAX + 1e-9 for w in laters)
+            if not (can_accel or can_brake):
+                continue                             # this leader fully clamped → try next
+            if can_accel:
+                a_set[L] = min(float(a_set[L]) + step, utils.A_MAX)
+            for w in laters:                         # brake the later arriver(s); lock them
+                a_set[w] = max(float(a_set[w]) - step, -utils.B_MAX)
+                braked[w] = True
+            acted = True
+            break                                    # one leader, then RE-SORT
+        if not acted:                                # nobody can move → infeasible/clamped
+            break
+
+    out = a.clone()
+    out[idx] = a_set
+    return out
+
+
+# ── UNIFIED PER-STEP CONTROL ────────────────────────────────────────────────────
+# The single control step shared by sim_torch.simulate, run_turns and cosim_sumo so the
+# three harnesses can never drift: kernel command → 2-D role gate → hinge proxy polish.
+# Movement-GENERAL — pass `conf` (true per-pair crossing) and `geo_order` for the
+# 12-movement turn geometry; omit them for the straight axis-proxy (4 movements).
+class ControlOut(NamedTuple):
+    a:          torch.Tensor          # final command (post gate + proxy), detached
+    yield_mask: object                # [N,N] per-pair yield mask, or None (no gate)
+    feat:       object                # [N,4] controller query features, or None
+    defer:      object                # [N] gate-defer mask, or None
+    a_raw:      torch.Tensor          # raw kernel command BEFORE the gate (for f-harvest)
+    a_gate:     torch.Tensor          # command AFTER gate, BEFORE proxy (for gate_log)
+
+
+def control_step(xe, xl, v, v_lead, ego_d, rival_d, rival_v, valid, P, a_prev,
+                 s, mv, geo, s_junc, *, s_cp=None, conf=None, geo_order=None,
+                 mean_fn=None, pred_override=None, force_roll=None,
+                 use_gate=True, role_gate=True, box_exclusive=True,
+                 proxy="fgd", delta_safe=None, proxy_delta_safe=None,
+                 controller_kwargs=None, verbose=False):
+    """One per-step control pass.  Returns a ControlOut.
+
+      proxy ∈ {None, 'fgd', 'time', 'grad-free'} selects the hinge polish AFTER the gate
+        ('fgd' = RKHS functional-gradient on the spatial hinge, the default; 'time' = the
+        time-domain hinge; 'grad-free' = the iterative proxy).  None ⇒ no polish.
+      controller_kwargs : extra kwargs forwarded to utils.controller_acceleration
+        (e.g. kappa, brake_exempt, brake_floor, promote, prio_ego/prio_rival) — this is
+        where the harnesses' small differences live, NOT in separate control code paths.
+    """
+    ck = dict(controller_kwargs or {})
+    N = valid.shape[0]
+    Pmat = P.unsqueeze(0).expand(N, N) if P.dim() == 1 else P
+    out = utils.controller_acceleration(
+        xe, xl, v, v_lead, d_conf=ego_d, rival_d=rival_d, rival_v=rival_v,
+        rival_valid=valid, ego_pressure=P, rival_pressure=Pmat, a_prev=a_prev,
+        pred_override=pred_override, mean_fn=mean_fn,
+        return_roles=use_gate, return_feat=use_gate, **ck)
+    if not use_gate:
+        a = out.detach()
+        return ControlOut(a, None, None, None, a, a)
+
+    a, yield_mask, feat = out
+    a_raw = a.detach().clone()
+    defer = None
+    if role_gate:
+        a, defer = rollout_gate(a.detach(), s, v, mv, yield_mask, geo, s_junc,
+                                verbose=verbose, return_defer=True, delta_safe=delta_safe,
+                                force_roll=force_roll, conf=conf, geo_order=geo_order,
+                                box_exclusive=box_exclusive)
+        a = a.detach()
+    a_gate = a.detach().clone()                      # post-gate, pre-proxy (gate_log probe)
+    if proxy == "fgd":
+        a = hinge_gradient_gate(a.detach(), feat.detach(), s, v, mv, geo, s_junc,
+                                delta_safe=proxy_delta_safe, conf=conf,
+                                geo_order=geo_order).detach()
+    elif proxy == "time":
+        a = time_hinge_gradient_gate(a.detach(), feat.detach(), s, v, mv, s_cp, s_junc,
+                                     delta_safe=proxy_delta_safe).detach()
+    elif proxy == "grad-free":
+        a = proxy_hinge_gate(a.detach(), s, v, mv, s_cp, s_junc,
+                             delta_safe=proxy_delta_safe).detach()
+    return ControlOut(a, yield_mask, feat, defer, a_raw, a_gate)
+
+
 def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
              events=None, gate2d=True, dt=DT, verbose=False, mean_model=None,
-             hinge_gate=HINGE_GATE, f_log=None):
+             hinge_gate=HINGE_GATE, hinge_time=False, hinge_proxy=False,
+             role_gate=True, proxy_delta_safe=None, f_log=None, gate_log=None,
+             conf=None, geo_order=None, vph=None):
     DT_ = dt
     if geo is None:
         geo, s_cp, path_len, s_junc = build_geometry()
+    # turn-mode iff a CONF mask is supplied (12-movement geometry); else straight 4-mv.
+    M = int(s_junc.shape[0])
+    is_turn = conf is not None
+    force_roll = None                  # sim_torch has no promotion latch (cosim/run_turns do)
+    # per-movement travel axis (0=EW,1=NS) and sign (±1) — needed for the cross test
+    # (straight) and always for build_context.  Turn mode reads the 12-movement table.
+    if is_turn:
+        import turns_geom as G
+        _mv = G.movements(NET_PATH)
+        AX_FULL = torch.tensor([m.axis for m in _mv])
+        SG_FULL = torch.tensor([float(m.sgn) for m in _mv])
+    else:
+        AX_FULL = _AXIS
+        SG_FULL = torch.tensor([float(C.ORIGIN[m][1]) for m in C._MOVES])
+    # padded polylines for batched footprint interpolation (movement-general; straight
+    # geo is name-keyed via C._MOVES, turn geo is index-keyed via geo_order=range(M))
+    PTS, CUM = pad_geometry(geo, geo_order)
     if events is None:
-        events = gen_events(flow, seed)
+        events = (gen_turn_events(vph, seed) if is_turn else gen_events(flow, seed))
     Ntot = len(events)
     depart = torch.tensor([e[0] for e in events])
     move   = torch.tensor([e[1] for e in events], dtype=torch.long)
@@ -590,7 +892,7 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
         # spawn: per move, if entry clear, admit the earliest pending due vehicle.
         # New front spawns at s=L_VEH, so the nearest leader's REAR (min_s − L) must
         # clear the new front by SPAWN_GAP: min_s ≥ 2·L + gap.
-        for mi in range(4):
+        for mi in range(M):
             am = (state == 1) & (move == mi)
             min_s = float(s[am].min()) if am.any() else 1e9
             if min_s >= 2.0 * L_VEH + SPAWN_GAP:
@@ -613,7 +915,7 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
         if Na == 0:
             continue
         s_a, v_a, mv_a = s[act], v[act], move[act]
-        ax_a = _AXIS[mv_a]
+        ax_a, sgn_a = AX_FULL[mv_a], SG_FULL[mv_a]
 
         # in-lane leader (same movement, ahead)
         same = mv_a.unsqueeze(0) == mv_a.unsqueeze(1)
@@ -632,8 +934,9 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
         ego_d   = scp_e - s_a.unsqueeze(1)
         rival_d = scp_r - s_a.unsqueeze(0)
         rival_v = v_a.unsqueeze(0).expand(Na, Na)
-        valid = ((ax_a.unsqueeze(1) != ax_a.unsqueeze(0)) & ~eye
-                 & (ego_d > 0.0) & (rival_d > -CLEAR)
+        # cross test: TRUE per-pair crossing from CONF in turn mode; straight axis-proxy else
+        cross_ij = conf[mv_a][:, mv_a] if is_turn else (ax_a.unsqueeze(1) != ax_a.unsqueeze(0))
+        valid = (cross_ij & ~eye & (ego_d > 0.0) & (rival_d > -CLEAR)
                  & ~torch.isnan(ego_d) & ~torch.isnan(rival_d))
         ego_d   = torch.nan_to_num(ego_d, nan=1e3)
         rival_d = torch.nan_to_num(rival_d, nan=-1e3)
@@ -658,44 +961,45 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
                         & (s_a.unsqueeze(0) < s_a.unsqueeze(1))).float().sum(dim=1)
             d_junc = s_junc[mv_a] - s_a
             ctx = mean_net.build_context(v_a, gap, v_lead, P, behind_n, d_junc,
-                                         ego_d, rival_d, valid, roles)
+                                         ego_d, rival_d, valid, roles, ax_a, sgn_a)
             mean_fn = mean_model.make_mean_fn(mean_model.encode(*ctx))
 
-        out = utils.controller_acceleration(
-            torch.zeros(Na), gap + L_VEH, v_a, v_lead,
-            d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
-            ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
-            a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
-            return_roles=gate2d, return_feat=gate2d,
-            pred_override=pred_override, mean_fn=mean_fn)
-        if gate2d:
-            a, yield_mask, feat = out
-            # harvest (g, τ_c, r, f, Δa) at the ACTUAL operating φ* for the f-contour.
-            # f  = raw learned prior mean;  Δa = its NET effect on the command
-            # (with-mean − zero-mean), which is ~0 wherever the anchors pin the output.
-            if f_log is not None and mean_fn is not None:
-                with torch.no_grad():
-                    fvals = mean_fn(feat)                        # [Na] learned mean at φ*
-                    a_zero = utils.controller_acceleration(
-                        torch.zeros(Na), gap + L_VEH, v_a, v_lead,
-                        d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
-                        ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
-                        a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
-                        pred_override=pred_override, mean_fn=None)   # zero-mean command
-                    da = a.detach() - a_zero                     # f's net effect on accel
-                # [Na, 6] = g, τ_c, r, f, Δa, a_zero (the physics/zero-mean prescribed accel)
-                f_log.append(torch.cat([feat.detach(), fvals.detach().unsqueeze(-1),
-                                        da.unsqueeze(-1), a_zero.unsqueeze(-1)], dim=-1))
-            if verbose and step % 20 == 0:
-                print(f"  t={t:5.1f}s  active={Na}")
-            a = rollout_gate(a.detach(), s_a, v_a, mv_a, yield_mask, geo, s_junc,
-                             verbose=verbose and step % 20 == 0)
-            # RKHS-smoothed hinge polish AFTER the role-based gate (box-exclusivity intact)
-            if hinge_gate:
-                a = hinge_gradient_gate(a.detach(), feat.detach(),
-                                        s_a, v_a, mv_a, geo, s_junc).detach()
-        else:
-            a = out.detach()
+        # select the post-gate hinge polish from the diagnostic flags (default 'fgd')
+        proxy_sel = (("grad-free" if hinge_proxy else "time" if hinge_time else "fgd")
+                     if hinge_gate else None)
+        if verbose and step % 20 == 0 and gate2d:
+            print(f"  t={t:5.1f}s  active={Na}")
+        co = control_step(
+            torch.zeros(Na), gap + L_VEH, v_a, v_lead, ego_d, rival_d, rival_v, valid,
+            P, prev_a[act], s_a, mv_a, geo, s_junc, s_cp=s_cp, conf=conf, geo_order=geo_order,
+            mean_fn=mean_fn, pred_override=pred_override, force_roll=force_roll,
+            use_gate=gate2d, role_gate=role_gate, proxy=proxy_sel,
+            proxy_delta_safe=proxy_delta_safe,
+            controller_kwargs=dict(kappa=0.5, brake_exempt=True),
+            verbose=verbose and step % 20 == 0)
+        a, yield_mask, feat = co.a, co.yield_mask, co.feat
+        # harvest (g, τ_c, r, f, Δa) at the ACTUAL operating φ* for the f-contour. f = raw
+        # learned prior mean; Δa = its NET effect on the PRE-GATE command (with−without mean).
+        if gate2d and f_log is not None and mean_fn is not None:
+            with torch.no_grad():
+                fvals = mean_fn(feat)                            # [Na] learned mean at φ*
+                a_zero = utils.controller_acceleration(
+                    torch.zeros(Na), gap + L_VEH, v_a, v_lead,
+                    d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
+                    ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(Na, Na),
+                    a_prev=prev_a[act], kappa=0.5, brake_exempt=True,
+                    pred_override=pred_override, mean_fn=None)    # zero-mean command
+                da = co.a_raw - a_zero                           # f's net effect on accel
+            f_log.append(torch.cat([feat.detach(), fvals.detach().unsqueeze(-1),
+                                    da.unsqueeze(-1), a_zero.unsqueeze(-1)], dim=-1))
+        # PROXY probe (plot_gate): the polish's own Δa by role/distance
+        if gate2d and proxy_sel == "grad-free" and gate_log is not None:
+            is_y = yield_mask.any(dim=1)
+            d_tj = s_junc[mv_a] - s_a
+            for i in range(Na):
+                if -30.0 < float(d_tj[i]) < 60.0:
+                    gate_log.append((float(d_tj[i]), "yield" if bool(is_y[i]) else "pass",
+                                     float(co.a_gate[i]), float(a[i])))
 
         v_new = (v_a + a * DT_).clamp(0.0, V_PHYS)
         prev_a[act] = a
@@ -709,12 +1013,7 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
         s_new = s_a + v_new * DT_
         any_hit = False
         for s_chk in (s_a + v_new * (DT_ / 2.0), s_new):
-            xy = torch.zeros(Na, 2); hd = torch.zeros(Na)
-            for mi in range(4):
-                m = C._MOVES[mi]
-                sel = (mv_a == mi).nonzero().flatten()
-                if len(sel):
-                    xy[sel], hd[sel] = _interp(geo[m][0], geo[m][1], s_chk[sel] - L_VEH / 2.0)
+            xy, hd = _interp_batch(PTS, CUM, mv_a, s_chk - L_VEH / 2.0)
             hit, pairs = collisions(xy, hd)
             if hit:
                 any_hit = True
@@ -731,7 +1030,9 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
         nh = ((d_to_j > -JCT_PAST) & (d_to_j < 60.0)).nonzero().flatten()
         if len(nh) >= 2:
             dd = (xy[nh].unsqueeze(0) - xy[nh].unsqueeze(1)).norm(dim=-1)
-            crossh = (ax_a[nh].unsqueeze(0) != ax_a[nh].unsqueeze(1)) & torch.triu(
+            crossh_ij = (conf[mv_a[nh]][:, mv_a[nh]] if is_turn
+                         else (ax_a[nh].unsqueeze(0) != ax_a[nh].unsqueeze(1)))
+            crossh = crossh_ij & torch.triu(
                 torch.ones(len(nh), len(nh), dtype=torch.bool), 1)
             hinge_total += float((torch.relu(D_SAFE_2D - dd[crossh]).pow(2)).sum()) * DT_
 
@@ -749,19 +1050,37 @@ def simulate(flow=300, seed=0, geo=None, s_cp=None, path_len=None, s_junc=None,
 
 
 if __name__ == "__main__":
-    flow = int(sys.argv[1]) if len(sys.argv) > 1 else 300
-    seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    toks = sys.argv[1:]
+    hinge_time  = "time" in toks                      # TIME-domain hinge (exact FGD)
+    hinge_proxy = "proxy" in toks                     # gradient-free proxy of the time hinge
+    sweep       = "sweep" in toks                      # compare spatial / time / proxy over seeds
+    nums = [t for t in toks if t.lstrip("-").isdigit()]
+    flow = int(nums[0]) if len(nums) > 0 else 300
+    seed = int(nums[1]) if len(nums) > 1 else 0
     geo, s_cp, path_len, s_junc = build_geometry()
     print("path lengths:", [round(float(x), 1) for x in path_len])
     print("conflict-point arc-lengths s_cp[ego,rival]:")
     print(torch.round(s_cp * 10) / 10)
-    print(f"\nrunning flow={flow} seed={seed} (junction-windowed gate, verbose)\n")
-    t0 = time.time()
-    r = simulate(flow, seed, geo, s_cp, path_len, s_junc, verbose=True)
-    print(f"\n=== flow={flow} seed={seed} ===")
-    print(f"  collided vehicles : {r['collided']}")
-    print(f"  collision steps   : {r['coll_steps']}")
-    print(f"  rear / cross pairs: {r['n_rear']} / {r['n_cross']}")
-    print(f"  arrived           : {r['arrived']}")
-    print(f"  steady-state rate : {r['ss_rate']:.0f} veh/h")
-    print(f"  wall time         : {time.time()-t0:.2f}s")
+    if sweep:
+        print(f"\nspatial / TIME / PROXY hinge, flow={flow}, seeds 0-4, H_2D={H_2D}s, δ_safe={utils.DELTA_SAFE}s")
+        print("  (coll = colliding vehicles, X = cross-collision pairs, arr = arrived)\n")
+        print(f"  {'seed':>4} | {'spatial  coll/X/arr':>20} | {'time  coll/X/arr':>18} | {'proxy  coll/X/arr':>18}")
+        for sd in range(5):
+            rs = simulate(flow, sd, geo, s_cp, path_len, s_junc, hinge_time=False)
+            rt = simulate(flow, sd, geo, s_cp, path_len, s_junc, hinge_time=True)
+            rp = simulate(flow, sd, geo, s_cp, path_len, s_junc, hinge_proxy=True)
+            f = lambda r: f"{r['collided']}/{r['n_cross']}/{r['arrived']}"
+            print(f"  {sd:>4} | {f(rs):>20} | {f(rt):>18} | {f(rp):>18}")
+    else:
+        mode = "PROXY" if hinge_proxy else ("TIME-domain" if hinge_time else "spatial")
+        print(f"\nrunning flow={flow} seed={seed} ({mode} hinge, H_2D={H_2D}s, verbose)\n")
+        t0 = time.time()
+        r = simulate(flow, seed, geo, s_cp, path_len, s_junc,
+                     hinge_time=hinge_time, hinge_proxy=hinge_proxy, verbose=True)
+        print(f"\n=== flow={flow} seed={seed}  [{mode} hinge] ===")
+        print(f"  collided vehicles : {r['collided']}")
+        print(f"  collision steps   : {r['coll_steps']}")
+        print(f"  rear / cross pairs: {r['n_rear']} / {r['n_cross']}")
+        print(f"  arrived           : {r['arrived']}")
+        print(f"  steady-state rate : {r['ss_rate']:.0f} veh/h")
+        print(f"  wall time         : {time.time()-t0:.2f}s")

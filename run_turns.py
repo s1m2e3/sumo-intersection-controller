@@ -1,15 +1,21 @@
-"""First turn-movement probe: run OUR controller in SUMO with LEFT/THROUGH/RIGHT
-movements and measure throughput + conflict gap.
+"""Unified straight + turn harness: run OUR controller in SUMO over all 12 movements
+(LEFT/THROUGH/RIGHT per approach) and measure throughput, conflict gap, and collisions.
+The straight-cross case is just the l=0, r=0 subset of this same code — the demand config
+(per-direction vph) is the ONLY knob that switches scenarios; geometry, kernel, role gate
+and FGD proxy are all movement-general.
 
-Scope (first cut, deliberately simple):
+Stack (all turn-general):
   • all 12 movements (entry→exit) with TRUE per-pair conflict points (turns_geom);
   • conflict = "paths cross" (CP exists) — catches left-turn vs oncoming-through, etc.;
   • roles from utils.predecessor_gap (timing) PLUS the rule: a TURNING movement yields
     to through traffic unless it has space (a clear predecessor gap) or is promoted;
-  • NO 2-D rollout gate / RoleMemory latch (those are still straight-only) — so this is
-    the raw controller; collisions are NOT a fair metric here, throughput + τ_c are.
+  • 2-D rollout gate (box-exclusive, true per-pair crossing) — the discrete safety gate;
+  • FGD PROXY hinge (use_proxy, default on) AFTER the gate, at a stricter proxy τ_safety,
+    sweeping each vehicle's real curved path — the same proxy as the straight cosim path.
 
-    conda run -n car-following-sumo python run_turns.py [flow] [seed]
+    conda run -n car-following-sumo python run_turns.py [seed] [l=..] [s=..] [r=..] \\
+        [ds=<kernel τ>] [proxy=<proxy τ>] [nonn] [nogate] [noproxy] [gui]
+    e.g.  ... run_turns.py 0 l=100 s=300 r=100 ds=5 proxy=5     # 300 thru / 100 L / 100 R
 """
 import os, sys, time
 import numpy as np
@@ -30,14 +36,25 @@ ROLE_COLOR = {"yield": (220, 40, 40, 255), "pass": (40, 200, 40, 255),
               "none": (170, 170, 170, 255)}
 
 
-def write_turn_routes(path):
+def write_turn_routes(path, vph=None, approaches=None):
+    """Emit one SUMO <flow> per movement at the per-direction demand `vph` (defaults to
+    the module VPH).  A direction with demand 0 emits no vehicles, so the SAME harness
+    collapses to the pure straight-cross case at vph={'l':0,'s':N,'r':0} and to a full
+    turning intersection at any nonzero l/r.  `approaches` (set of entry-edge ids, e.g.
+    {'east_in','west_in'}) restricts flow to those approaches only — movements from any
+    other entry get zero, so we can drive e.g. the EW/WE legs alone with NS/SN empty."""
+    vph = VPH if vph is None else vph
     mv = G.movements(os.path.join(C.HERE, "intersection.net.xml"))
     with open(path, "w") as f:
         f.write('<routes>\n'
                 '  <vType id="car" accel="2.6" decel="4.5" sigma="0" length="5" '
                 'minGap="2.0" maxSpeed="13.89" carFollowModel="Krauss"/>\n')
         for m in mv:
-            rate = VPH[m.dir] / 3600.0
+            if approaches is not None and m.frm not in approaches:
+                continue                       # approach excluded → no flow
+            rate = vph[m.dir] / 3600.0
+            if rate <= 0.0:
+                continue                       # no demand on this direction → no flow
             f.write(f'  <flow id="f{m.idx}" type="car" from="{m.frm}" to="{m.to}" '
                     f'begin="0" end="120" period="exp({rate:.5f})" '
                     f'departLane="best" departSpeed="{V_PHYS}"/>\n')
@@ -57,10 +74,27 @@ def load_model():
     return m
 
 
-def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
+def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True,
+        use_proxy=True, kernel_delta_safe=None, proxy_delta_safe=5.0, vph=None,
+        dump_t=None, approaches=None):
+    """Unified straight+turn harness.  `vph` (per-direction demand dict) is the ONLY knob
+    that selects the scenario — the geometry, kernel, gate and proxy are movement-general.
+
+      kernel_delta_safe : kernel τ_safety (s).  When given, set globally BEFORE any
+                          controller call so the anchor grid / GP inverse rebuild cleanly.
+      proxy_delta_safe  : the FGD proxy's stricter τ_safety (s), applied AFTER the role
+                          gate (use_proxy).  Decoupled from the kernel δ_safe, exactly like
+                          the straight cosim path (kernel targets δ_safe; proxy enforces ≥).
+    """
+    DUMP_T = dump_t                              # sim time (s) for the one-shot state snapshot
+    global VPH
+    if vph is not None:
+        VPH = dict(vph)                          # demand config drives the whole run
+    if kernel_delta_safe is not None:
+        utils.set_delta_safe(float(kernel_delta_safe))
     net = os.path.join(C.HERE, "intersection.net.xml")
     routes = os.path.join(C.HERE, "_turn_routes.rou.xml")
-    write_turn_routes(routes)
+    write_turn_routes(routes, VPH, approaches=approaches)
     mv = G.movements(net)
     M = len(mv)
     geo_g, s_cp_g, s_junc_g, CONF = G.gate_geometry(net)          # 12-movement gate geometry
@@ -84,7 +118,10 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
     # reshapes ARRIVAL TIMES so the box's FCFS-by-ETA race naturally serves the starved class — the
     # kernel/gate are untouched (a held vehicle is just a far, stopped, low-priority car, invisible
     # to the conflict race: v=0 → η→∞ → no one yields to it, and it is 80 m from the conflict zone).
-    USE_METER = True
+    USE_METER = False         # DISABLED: the upstream meter holds over-served classes to a full STOP
+                              # D_METER m UPSTREAM of the box — a mid-road stop, which violates the rule
+                              # that only a vehicle right before the junction may be fully stopped.  The
+                              # only legitimate full stop is the anti-promoted hold AT the stop-line.
     D_METER   = 80.0          # meter line: arc-length from box entry where over-served classes wait
     METER_TOL = 1.0           # release slack (vehicles) around fair share — damps hold/release chatter
     MAX_HOLD  = 8.0           # liveness cap: never hold one vehicle longer than this (no box idling)
@@ -119,7 +156,9 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
     configured, mv_idx, prev_a, stuck = set(), {}, {}, {}
     released, held_t = set(), {}               # metering: vehicles past the meter line / per-veh hold time
     STUCK_V, STUCK_HOLD = 3.0, 4.0           # a vehicle creeping <3 m/s near the box >4 s is "starved"
-    N_PROMOTE = 5                            # vehicles per promoted compatible platoon (window = 5th's clearance)
+    N_PROMOTE = 8                            # phase-window length = car-following clearance time of the
+                                             # N_PROMOTE-th front seed-lane vehicle (longer window ⇒ more
+                                             # of the clique clears per phase; not a cap on who is promoted)
     phase_mvs, phase_end = [], -1.0          # LATCHED promotion (only active during starvation)
     arrived, collided = [], set()
     from collections import defaultdict
@@ -127,6 +166,9 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
     dep_dir, arr_dir = defaultdict(int), defaultdict(int)   # served-per-movement (vs Krauss)
     tc_min, tc_max, tc_sum, tc_n = float("inf"), 0.0, 0.0, 0
     _DBG = {"departed": 0, "promoted_steps": 0, "inbox_max": 0, "N_max": 0}
+    _DBG["promo_mv"] = defaultdict(int)     # promoted (p=+1) veh-steps per movement idx
+    _DBG["anti_mv"]  = defaultdict(int)     # anti-promoted (p=-1) veh-steps per movement idx
+    _DBG["seed_mv"]  = defaultdict(int)     # times each movement was the phase SEED (latch)
 
     for step in range(n_steps):
         t_wall = time.perf_counter()
@@ -162,6 +204,27 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
             if ld and ld[0] in mv_idx:
                 gap[i] = max(ld[1], 0.0)
                 if ld[0] in sub: v_lead[i] = sub[ld[0]][tc.VAR_SPEED]
+
+        # SUPPLEMENT the route-based getLeader with a same-approach, same-LANE in-lane leader.
+        # getLeader follows the EGO's downstream route, so it LOSES a leader that diverges onto a
+        # different internal lane at the junction mouth — e.g. a THROUGH stopped at the line is no
+        # longer "ahead" for a RIGHT that shares its approach lane (their paths split in the box).
+        # The kernel then sees a huge gap and rear-ends it.  Recover it by arc-length: through+right
+        # share a lane (idx%3∈{0,1}); left rides its own (idx%3==2).  A same-approach, same-lane-group
+        # vehicle that is AHEAD (larger arc-pos) and closer than the route leader sets the gap.
+        appr = (mvi // 3)
+        left_lane = (mvi % 3 == 2)                                # left has a dedicated lane
+        for i in range(N):
+            if float(d_junc[i]) <= 0.0:                           # only APPROACHING egos (in-box clears)
+                continue
+            for j in range(N):
+                if i == j or int(appr[j]) != int(appr[i]) or bool(left_lane[i]) != bool(left_lane[j]):
+                    continue                                      # not a same-lane neighbour
+                if float(d_junc[j]) <= -2.0:                      # leader deep in box on its own diverged
+                    continue                                      # internal lane → arc-length gap invalid
+                dg = float(s_front[j]) - float(s_front[i]) - utils.L_VEH   # bumper gap (j ahead ⇒ >0)
+                if 0.0 <= dg < float(gap[i]):
+                    gap[i] = dg; v_lead[i] = float(vs[j])
 
         # ARC-LENGTH per-pair conflict geometry from the conflict-point arc-lengths s_cp
         # (correct for curved turn paths — not an entry-axis projection).  ego_d[a,b] =
@@ -222,9 +285,20 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
         # final conflict point.
         if t >= phase_end and bool((stuck_t > STUCK_HOLD).any()):
             seed = int(mvi[int(stuck_t.argmax())])
+            _DBG["seed_mv"][seed] += 1
+            # Build the compatible-movement clique to PROMOTE.  Movements are grouped 3/approach
+            # (idx//3 = approach E,W,N,S; idx%3 = dir r,s,l), and opposing approaches share an
+            # axis (appr ^ 1).  The greedy clique is order-sensitive, so we add the OPPOSING
+            # same-direction movement FIRST — for a left seed that is the opposing left, the classic
+            # PROTECTED-LEFT pair (always mutually compatible, they don't cross).  Adding it before
+            # the index-order turns stops a compatible-with-seed-but-conflicts-with-partner movement
+            # (e.g. north_in.r, which crosses south_in.l) from greedily locking the partner out and
+            # leaving it stranded on the promoted queue's path.  Same-dir movements next, then the rest.
+            opp = ((seed // 3) ^ 1) * 3 + (seed % 3)     # opposite-approach, same-direction movement
             phase = [seed]
-            for m in range(M):
-                if m != seed and all(bool(COMPAT[m, p]) for p in phase):
+            for m in sorted((x for x in range(M) if x != seed),
+                            key=lambda x: (x != opp, x % 3 != seed % 3, x)):
+                if all(bool(COMPAT[m, p]) for p in phase):
                     phase.append(m)
             phase_mvs = phase
             sidx = sorted([i for i in range(N) if int(mvi[i]) == seed and bool(near[i])],
@@ -240,24 +314,32 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
                 T_clear = 3.0
             phase_end = t + max(T_clear, 2.0)
 
-        # per-vehicle PROMOTION FLAG p∈{0,1} for the KERNEL: 1 for the front N_PROMOTE of the
-        # latched compatible group near the box.  The kernel's p=1 anchors make them PASS
-        # (assert/free, g<1 brake kept); p=0 vehicles negotiate normally and yield to the
-        # now-asserting promoted ones by conflict-gap ETA.  No external gate.
+        # physical junction occupancy (SUMO ':' internal-lane road id) — TRUE ground truth for
+        # "this vehicle is inside the box", independent of the arc-length d_junc metric.
+        on_box = [str(sub[v][tc.VAR_ROAD_ID]).startswith(":") for v in vehs]
+
+        # ── PROMOTION SET (γ-among-promoted pipeline).  Build the FULL promoted set FIRST, then let
+        # γ decide pass/yield within it (rival masking at the kernel call below):
+        #   (1) QUEUE  — every vehicle on a compatible movement in the latched phase clique.
+        #   (2) MUST-CLEAR — every vehicle physically in the box (':' lane), ANY movement, so it
+        #       asserts/serializes OUT instead of freezing mid-junction.
+        # Both get promoted=True (kernel p=0 → γ is EVALUATED, not dropped).  γ is then computed only
+        # among this set: each promoted vehicle yields iff another PROMOTED vehicle reaches the shared
+        # conflict point earlier (ETA) — so the must-clear intruder (earliest) passes and a conflicting
+        # phase vehicle yields to it.  Compatible promoted pairs share no conflict point ⇒ both pass.
+        # Every INCOMPATIBLE APPROACHER (phase active, not promoted) is ANTI-PROMOTED (p=-1): free-flow
+        # to its stop-line, held there, and INVISIBLE to the promoted γ.  No phase ⇒ all p=0 (original).
         promote = torch.zeros(N)
         promoted = torch.zeros(N, dtype=torch.bool)
         if t < phase_end and phase_mvs:
-            in_phase = torch.tensor([int(mvi[i]) in phase_mvs for i in range(N)])
-            cand = sorted((in_phase & near).nonzero().flatten().tolist(),
-                          key=lambda i: float(s_front[i]), reverse=True)
-            for i in cand[:N_PROMOTE]:
-                promote[i] = 1.0; promoted[i] = True
-        # NOTE: a "promotion grants right-of-way" patch (force cross traffic to yield to the
-        # promoted group so its queue drains) was tried and REVERTED — even guarded to only
-        # vehicles that can still stop, it reintroduced collisions (seeds 1,2) and did not raise
-        # throughput.  Forcing extra yields destabilizes the FCFS safety (a known dead-end here).
-        # Through-movement starvation under FCFS remains an open fairness problem; it needs a
-        # mechanism that does NOT force yields (e.g. upstream metering / slot reservation).
+            for i in range(N):
+                mv_i = int(mvi[i])
+                if (mv_i in phase_mvs) or on_box[i]:              # (1) queue  ∪  (2) must-clear
+                    promoted[i] = True                           # p=0 ⇒ γ evaluated among promoted
+                    _DBG["promo_mv"][mv_i] += 1
+                else:
+                    promote[i] = -1.0                            # incompatible approacher → held at line
+                    _DBG["anti_mv"][mv_i] += 1
         is_yield = yield_eta.any(1) & (~promoted)              # for GUI coloring
 
         mean_fn = None
@@ -270,15 +352,35 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
             mean_fn = mean_model.make_mean_fn(mean_model.encode(*ctx))
 
         a_prev_t = torch.tensor([prev_a.get(v, 0.0) for v in vehs])
-        # the KERNEL resolves everything: p=0 → ETA cross negotiation + δ_safe brake + g<1
-        # floor; p=1 → PASS (the promotion state in the 4-D kernel).  No external gate.
-        a = utils.controller_acceleration(
+        # γ-AMONG-PROMOTED: a promoted ego negotiates yield/pass ONLY against OTHER promoted
+        # vehicles — the held incompatible traffic is masked out (invisible).  So the kernel's
+        # normal ETA cross-resolution, restricted to this subset, decides who passes and who yields
+        # WITHIN the promoted group: the must-clear intruder (earliest) passes; the conflicting
+        # phase vehicle yields to it.  Non-promoted egos keep the full rival set (unchanged).
+        valid_k = valid.clone()
+        if bool(promoted.any()):
+            valid_k[promoted] = valid[promoted] & promoted.unsqueeze(0)
+        # the KERNEL resolves everything: p=0 → ETA cross negotiation (here restricted to the
+        # promoted subset for promoted egos) + δ_safe brake + g<1 floor; p=-1 → free-flow to line.
+        c_out = utils.controller_acceleration(
             torch.zeros(N), gap + utils.L_VEH, vs, v_lead,
-            d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid,
+            d_conf=ego_d, rival_d=rival_d, rival_v=rival_v, rival_valid=valid_k,
             ego_pressure=P, rival_pressure=P.unsqueeze(0).expand(N, N),
             a_prev=a_prev_t, kappa=0.5, brake_exempt=True,
             brake_floor=True, predecessor=False, promote=promote, mean_fn=mean_fn,
-            prio_ego=prio.unsqueeze(1), prio_rival=prio.unsqueeze(0)).detach()
+            prio_ego=prio.unsqueeze(1), prio_rival=prio.unsqueeze(0),
+            return_feat=use_proxy)
+        # feat = [N,4] live query features (g, τ_c, r, p) — the proxy builds the
+        # controller's own ARD Gram K^φ over them to smooth its hinge step.
+        feat = None
+        if use_proxy:
+            a, feat = c_out
+            a = a.detach()
+        else:
+            a = c_out.detach()
+        _a_kernel = a.clone()                  # diag: command straight out of the 4-D kernel
+        _a_gate = a.clone()                    # diag: post rollout-gate (set below if use_gate)
+        _defer = torch.zeros(N, dtype=torch.bool)
 
         # ── 2-D rollout gate (now turn-general): the final safety correction the raw
         # kernel lacks.  Box-exclusivity and the committed-crosser test key on the TRUE
@@ -293,6 +395,31 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
                 return_defer=True, force_roll=promoted, conf=CONF, geo_order=GEO_ORDER,
                 box_exclusive=box_exclusive)
             a = a.detach()
+            _a_gate = a.clone()                # diag: post rollout-gate, pre FGD proxy
+            if _gate_defer is not None:
+                _defer = _gate_defer.bool() if torch.is_tensor(_gate_defer) else _defer
+            # ── FGD PROXY (turn-general): L2 functional-gradient polish on the 2-D hinge,
+            # AFTER the role gate (box-exclusivity intact).  Same machinery as the straight
+            # cosim path — but the rollout sweeps each vehicle's REAL curved path
+            # (geo_order=GEO_ORDER) and pairs by TRUE per-pair crossing (conf=CONF), so it
+            # corrects left-turn-vs-through conflicts the discrete gate may underbrake.
+            # delta_safe=proxy_delta_safe enforces a stricter gap than the kernel's δ_safe.
+            if use_proxy:
+                a = S.hinge_gradient_gate(
+                    a, feat.detach(), s_front, vs, mvi, geo_g, s_junc_g,
+                    delta_safe=proxy_delta_safe, conf=CONF, geo_order=GEO_ORDER).detach()
+
+            # ── PROMOTED & IN-BOX use the KERNEL command (bypass the gate/proxy cross-corrections).
+            # The kernel already resolved γ AMONG the promoted set (rivals masked to promoted above):
+            # the must-clear/earliest vehicle passes, a conflicting promoted vehicle YIELDS (brakes to
+            # its conflict-line) — so cross safety within the promoted group is in a_kernel.  The gate,
+            # by contrast, is ETA-ordered over ALL vehicles and would make a promoted vehicle defer to
+            # the held anti-promoted traffic it's invisible to — backwards, and the source of the
+            # deadlock — so we discard it here.  a_kernel still carries the g<1 brake_floor (no in-lane
+            # rear-end).  Held incompatible approachers stay out of the box via anti_cap / box_cap.
+            for i in range(N):
+                if bool(promoted[i]) or on_box[i]:
+                    a[i] = _a_kernel[i]
 
         # ── UPSTREAM METER decision (per vehicle).  A vehicle is HELD this step iff it has not yet
         # passed the meter line, has reached it (d_junc ≤ D_METER), its movement-CLASS is OVER its
@@ -326,6 +453,54 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
                 else:
                     released.add(v)                          # let it through; never re-trap it
 
+        # ── ANTI-PROMOTED STOP-AT-LINE (mechanism 2): while a promotion phase owns the box,
+        # every INCOMPATIBLE movement is ANTI-PROMOTED (p=-1) — the kernel already drives it as a
+        # PASSER, so it is free to ACCELERATE up to the junction.  It must NOT enter the box, but
+        # we never freeze it mid-road: instead we cap its speed by the LATEST-BRAKE stop-at-line
+        # profile v_cap = √(2·B·d_entry).  Far from the line v_cap exceeds V_PHYS (full free-flow);
+        # it tightens to 0 exactly at the stop line, so the vehicle runs at speed until the last
+        # moment, then decelerates at ≤B_MAX and stops cleanly at the line, held there until the
+        # phase ends.  Guarded by can_hold — a COMMITTED crosser (too close/fast to stop) keeps
+        # v_cap=∞ and clears through rather than emergency-braking into the middle of the box.
+        anti_cap = torch.full((N,), float("inf"))
+        if t < phase_end and phase_mvs:
+            for i in range(N):
+                if bool(promoted[i]) or on_box[i]:
+                    continue                                 # promoted (incl. in-box clearers) or
+                                                             # already on the box → never cap/freeze
+                d_entry = float(s_junc_g[mvi[i]] - s_front[i]) - utils.STOP_OFFSET
+                d_need  = float(vs[i]) ** 2 / (2.0 * utils.B_MAX)
+                can_hold = (float(vs[i]) < 0.5) or (d_entry > d_need + S.EPS_ENTRY)
+                if float(d_junc[i]) > 0.0 and can_hold:       # approaching & able to stop
+                    anti_cap[i] = (2.0 * utils.B_MAX * max(d_entry, 0.0)) ** 0.5
+
+        # ── BOX ENTRY MUTUAL-EXCLUSION (asymmetric, physical occupancy + true per-pair conflict).
+        # While a phase owns the box, the PROMOTED clique owns it: its (compatible) members flow and
+        # co-occupy freely.  An INCOMPATIBLE (anti-promoted) approacher must NOT enter while a
+        # conflicting movement physically occupies the box ('::' lane) — it is capped to STOP at its
+        # stop-line, OVERRIDING anti_cap's can_hold escape (a "committed" crosser is forced to stop
+        # AT the line rather than nose into the box, since a full stop right at the line is allowed).
+        # This is the collision guard: a promoted N-S left and an incompatible E-W left can never both
+        # be inside the box (the t≈37 s T-bone).  Promoted vehicles and anything already in/past the
+        # box are exempt — they own the box / must clear, never freeze.  Keyed on PHYSICAL ':'
+        # occupancy (not arc-length d_junc<0), so it catches what the gate's box-exclusivity misses.
+        box_cap = torch.full((N,), float("inf"))
+        if t < phase_end and phase_mvs:
+            occ_mv = {int(mvi[i]) for i in range(N) if on_box[i]}
+            if occ_mv:
+                for i in range(N):
+                    if on_box[i] or float(d_junc[i]) <= 0.0:
+                        continue                                 # already in/past box → clear, not held
+                    if any(bool(CONF[occ, int(mvi[i])]) for occ in occ_mv):
+                        # a CONFLICTING movement physically occupies the box → hold at the line until
+                        # it has fully EXITED (on_box false), not merely passed its conflict point.
+                        # Applies to PROMOTED approachers too: the kernel's point-γ releases them as
+                        # soon as the clearer passes the point, but its BODY is still in the box — so
+                        # this body-aware hold is what prevents the tail T-bone.  Compatible promoted
+                        # (no CONF with the occupant) are NOT capped → the clique co-occupies and flows.
+                        d_entry = float(s_junc_g[mvi[i]] - s_front[i]) - utils.STOP_OFFSET
+                        box_cap[i] = (2.0 * utils.B_MAX * max(d_entry, 0.0)) ** 0.5
+
         for i, v in enumerate(vehs):
             prev_a[v] = float(a[i])
             if bool(held[i]):                                # brake to a stop at the meter line
@@ -333,7 +508,14 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
                 if gui:
                     traci.vehicle.setColor(v, (40, 120, 230, 255))   # BLUE = metered (held upstream)
                 continue
-            traci.vehicle.setSpeed(v, float(min(max(float(vs[i]) + float(a[i]) * DT, 0.0), V_PHYS)))
+            cap_i = min(float(anti_cap[i]), float(box_cap[i]))         # tightest stop-at-line cap
+            v_cmd = min(max(float(vs[i]) + float(a[i]) * DT, 0.0), V_PHYS, cap_i)
+            if cap_i < float(vs[i]) - 1e-3:                  # held at the line (anti-promoted or box-excluded)
+                traci.vehicle.setSpeed(v, v_cmd)
+                if gui:
+                    traci.vehicle.setColor(v, (200, 120, 0, 255))    # ORANGE = anti-promoted stop-at-line
+                continue
+            traci.vehicle.setSpeed(v, v_cmd)
             if gui:
                 # COLOR by what the vehicle is ACTUALLY doing, using PHYSICAL junction
                 # occupancy (SUMO ':' internal-lane road id) as ground truth — a vehicle on
@@ -348,6 +530,32 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
                 role = "pass" if going else ("yield" if bool(is_yield[i]) else "none")
                 traci.vehicle.setColor(v, ROLE_COLOR[role])
 
+        # ── STATE SNAPSHOT (diagnostic): at sim time DUMP_T, print the ACTUAL per-vehicle
+        # state for every near-box vehicle so a gridlock is fully legible — role label vs
+        # command, speed, leader gap, conflict gap τ_c, who it must yield to, promotion and
+        # metering.  Shows why a green (passing) car can sit at a≈0 (blocked / capped / held).
+        if DUMP_T is not None and abs(t - DUMP_T) < DT / 2 and N:
+            ny = yield_eta.sum(1)                                  # #rivals each ego must yield to
+            print(f"\n=== STATE @ t={t:.1f}s  (N={N}) — near-box vehicles ===")
+            print(f"{'veh':>7} {'dir':>3} {'role':>5} {'d_junc':>7} {'v':>5} "
+                  f"{'a_ker':>6} {'a_gate':>6} {'a_fin':>6} {'cap':>6} {'gap':>6} {'tau_c':>6} "
+                  f"{'nyld':>4} {'prom':>4} {'dfr':>3} {'held':>4} {'inbox':>5}")
+            order = sorted(range(N), key=lambda i: float(d_junc[i]))
+            for i in order:
+                if not (-10.0 < float(d_junc[i]) < 80.0):
+                    continue
+                going = (bool(promoted[i]) or float(a[i]) > 0.0
+                         or (on_box[i] and float(vs[i]) > 0.3)
+                         or (float(d_junc[i]) < 0.0 and float(vs[i]) > 0.5))
+                role = "pass" if going else ("yield" if bool(is_yield[i]) else "free")
+                cap = float(anti_cap[i]); cap_s = "  inf" if cap == float("inf") else f"{cap:>6.2f}"
+                print(f"{vehs[i]:>7} {DIRNAME[int(mvi[i])]:>3} {role:>5} "
+                      f"{float(d_junc[i]):>7.1f} {float(vs[i]):>5.2f} "
+                      f"{float(_a_kernel[i]):>6.2f} {float(_a_gate[i]):>6.2f} {float(a[i]):>6.2f} "
+                      f"{cap_s} {float(gap[i]):>6.1f} {float(tau_c_all[i]):>6.2f} {int(ny[i]):>4} "
+                      f"{int(bool(promoted[i])):>4} {int(bool(_defer[i])):>3} "
+                      f"{int(bool(held[i])):>4} {int(on_box[i]):>5}")
+
         _DBG["promoted_steps"] += int(promoted.sum())
         _DBG["inbox_max"] = max(_DBG["inbox_max"], int((d_junc < 0).sum()))
         _DBG["N_max"] = max(_DBG["N_max"], N)
@@ -356,7 +564,22 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
         arrived.append(traci.simulation.getArrivedNumber())
         for v in traci.simulation.getArrivedIDList():
             if v in mv_idx: arr_dir[DIRNAME[mv_idx[v]]] += 1
-        collided.update(traci.simulation.getCollidingVehiclesIDList())
+        new_coll = set(traci.simulation.getCollidingVehiclesIDList()) - collided
+        if new_coll:
+            idxmap = {v: i for i, v in enumerate(vehs)}
+            info = []
+            for cv in sorted(new_coll):
+                i = idxmap.get(cv)
+                if i is None:
+                    info.append(f"{cv}(gone)")
+                else:
+                    info.append(f"{cv}[{mv[int(mvi[i])].frm}.{DIRNAME[int(mvi[i])]} "
+                                f"prom={int(bool(promoted[i]))} box={int(on_box[i])} "
+                                f"v={float(vs[i]):.1f} gap={float(gap[i]):.1f} "
+                                f"aker={float(_a_kernel[i]):.2f} afin={float(a[i]):.2f} "
+                                f"d={float(d_junc[i]):.1f}]")
+            print(f"  [COLLISION @ t={t:.1f}s]  " + "   ".join(info))
+        collided.update(new_coll)
         if gui:
             time.sleep(max(0.0, DT - (time.perf_counter() - t_wall)))
 
@@ -366,6 +589,16 @@ def run(seed=0, mean_model=None, gui=False, use_gate=True, box_exclusive=True):
     print(f"  [dbg] departed={_DBG['departed']}  arrived={int(np.sum(arrived))}  "
           f"STILL_STUCK={residual}  in_network_peak={_DBG['N_max']}  "
           f"in_box_peak={_DBG['inbox_max']}  promoted_veh-steps={_DBG['promoted_steps']}")
+    DIRNAME = {m.idx: m.dir for m in mv}
+    seedmv = _DBG["seed_mv"]; promv = _DBG["promo_mv"]
+    print(f"  [promo] phase SEEDs by movement: " +
+          ("  ".join(f"{i}={mv[i].frm}.{DIRNAME[i]}:{seedmv[i]}" for i in sorted(seedmv))
+           or "NONE"))
+    print(f"  [promo] promoted veh-steps by movement: " +
+          ("  ".join(f"{i}={mv[i].frm}.{DIRNAME[i]}:{promv[i]}" for i in sorted(promv))
+           or "NONE"))
+    n_turn_promo = sum(v for i, v in promv.items() if DIRNAME[i] != "s")
+    print(f"  [promo] TURN promoted veh-steps={n_turn_promo} / total={sum(promv.values())}")
     traci.close()
     served = {d: (arr_dir[d], dep_dir[d]) for d in ("s", "l", "r")}
     print("  served by movement:  " +
@@ -386,10 +619,30 @@ if __name__ == "__main__":
     gui  = "gui" in tokens
     use_gate = "nogate" not in tokens
     box_exclusive = "nobox" not in tokens
+    use_proxy = "noproxy" not in tokens
     seed = next((int(t) for t in tokens if t.isdigit()), 0)
+    # demand config: l=<vph> s=<vph> r=<vph> (any omitted → module default).  This is the
+    # ONLY thing to change between the straight-cross case (l=0 r=0) and a turning one.
+    def _tok(pfx, default):
+        t = next((x for x in tokens if x.startswith(pfx)), None)
+        return float(t.split("=", 1)[1]) if t is not None else default
+    vph = {"l": _tok("l=", VPH["l"]), "s": _tok("s=", VPH["s"]), "r": _tok("r=", VPH["r"])}
+    # kernel τ_safety (ds=/dsafe=) and proxy τ_safety (proxy=) — default kernel from utils,
+    # proxy 5 s, matching the straight cosim convention.
+    kds = next((t for t in tokens if t.startswith(("dsafe=", "ds="))), None)
+    kernel_ds = float(kds.split("=", 1)[1]) if kds is not None else None
+    proxy_ds = _tok("proxy=", 5.0)
+    dump_t = next((float(t.split("=", 1)[1]) for t in tokens if t.startswith("dump=")), None)
+    # restrict to specific entry approaches: appr=east_in,west_in  (default: all four)
+    at = next((t for t in tokens if t.startswith("appr=")), None)
+    approaches = set(at.split("=", 1)[1].split(",")) if at is not None else None
     model = None if "nonn" in tokens else load_model()
-    r = run(seed, mean_model=model, gui=gui, use_gate=use_gate, box_exclusive=box_exclusive)
-    print(f"\nTURNS  L/S/R={VPH['l']}/{VPH['s']}/{VPH['r']} vph/approach  seed={seed}"
+    r = run(seed, mean_model=model, gui=gui, use_gate=use_gate, box_exclusive=box_exclusive,
+            use_proxy=use_proxy, kernel_delta_safe=kernel_ds, proxy_delta_safe=proxy_ds, vph=vph,
+            dump_t=dump_t, approaches=approaches)
+    print(f"\nTURNS  L/S/R={VPH['l']:.0f}/{VPH['s']:.0f}/{VPH['r']:.0f} vph/approach  seed={seed}"
+          f"  [kernel δ_safe={utils.DELTA_SAFE:.1f}s, proxy τ={proxy_ds:.1f}s, "
+          f"{'proxy ON' if use_proxy else 'proxy OFF'}]"
           f"  ({'nonn' if model is None else 'trained'}):")
     print(f"  throughput       : {r['vph']:.0f} veh/h  (arrived {r['arrived']})")
     print(f"  conflict gap τ_c : min {r['tau_c_min']:.2f} / mean {r['tau_c_mean']:.2f} / "

@@ -107,9 +107,21 @@ def _tauc_levels(ds):
 _TAUC_LEVELS = _tauc_levels(DELTA_SAFE)
 _ROLE_LEVELS = (0.0, 1.0)        # 0 = YIELDER, 1 = PASSER
 
-_PROMO_LEVELS = (0.0, 1.0)       # 0 = normal, 1 = PROMOTED (asserts through, drops cross yield)
+_PROMO_LEVELS = (-1.0, 0.0, 1.0) # -1 = ANTI-PROMOTED (free-flow to the line, held there by the
+                                 #      gate — incompatible with the active phase),
+                                 #  0 = normal, 1 = PROMOTED (asserts through, drops cross yield)
 
 def _anchor_target(g: float, tc: float, r: float, p: float = 0.0):
+    if p <= -0.5:
+        # ANTI-PROMOTED: incompatible with the active promotion phase.  It must NOT freeze
+        # mid-road — it FREE-FLOWS toward the junction (keeping only its own car-following
+        # safety), and is halted AT the stop-line by the phase block / gate box-exclusivity.
+        # No cross-timing (τ_c) dependence and no 'clear' assert: it never enters the box.
+        if g < 1.0:
+            return "brake"                      # car-following safety (its own leader)
+        if g == 1.0:
+            return 0.0                          # HOLD at the desired gap (stable equilibrium)
+        return "free"                           # roll at free-flow up to the line
     if p >= 0.5:
         # PROMOTION: the vehicle PASSES — the cross-conflict yield is dropped — but it
         # still keeps longitudinal safety: no gap (g<1) ⇒ it cannot push (brakes).
@@ -117,7 +129,13 @@ def _anchor_target(g: float, tc: float, r: float, p: float = 0.0):
             return "brake"                      # no gap → can't push (rear-end safety kept)
         if tc == 0.0:
             return "clear"                      # assert through the conflict point (a_max)
-        return "free"                           # free-flow, IGNORE the cross timing τ_c
+        if g == 1.0:
+            return 0.0                          # HOLD at the desired gap — STABLE equilibrium.
+                                                # Without this the promoted column jumps brake(g<1)
+                                                # ↔ free(g≥1) with no fixed point, so a follower
+                                                # limit-cycles (gas/brake/gas/brake). Mirrors the
+                                                # normal column's g==1 HOLD anchor.
+        return "free"                           # g≥2 (room ahead) → free-flow, IGNORE cross timing τ_c
     # p == 0 → normal behavior (unchanged)
     if g < 1.0:
         return "brake"                          # longitudinal safety dominates for both roles
@@ -553,7 +571,7 @@ def controller_acceleration(
     a_prev=None, kappa=1.0, brake_exempt=True,
     brake_floor=True, predecessor=True,
     pred_override=None,
-    promote=None,                       # [...] per-vehicle promotion flag p∈{0,1} (None ⇒ all 0)
+    promote=None,                       # [...] per-vehicle promotion flag p∈{-1,0,1} (None ⇒ all 0)
     prio_ego=None, prio_rival=None,     # optional right-of-way priority bias (s), non-predecessor mode
     return_roles=False,
     return_feat=False,
@@ -630,8 +648,9 @@ def controller_acceleration(
     # cosim's queue/latch memory sets has_pred upstream, so the queue promotion (yield→pass)
     # flips the whole role column here.
     r_feat = torch.where(has_pred, torch.zeros_like(g), torch.ones_like(g))
-    # PROMOTION feature p ∈ {0,1}: the kernel's 4th axis.  p=1 anchors prescribe the
-    # pass/clear behavior (cross yield dropped, g<1 brake kept) — see _anchor_target.
+    # PROMOTION feature p ∈ {-1,0,1}: the kernel's 4th axis.  p=1 anchors prescribe pass/clear
+    # (cross yield dropped, g<1 brake kept); p=-1 (anti-promoted) prescribes free-flow-to-the-line
+    # with no cross/clear; p=0 is the normal column — see _anchor_target.
     p_feat = torch.zeros_like(g) if promote is None else promote.to(g.dtype)
 
     feat = torch.stack([g, tau_c, r_feat, p_feat], dim=-1)     # [..., 4]

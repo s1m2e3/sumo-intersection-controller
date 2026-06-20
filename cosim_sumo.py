@@ -165,7 +165,7 @@ def _cp_tensors(net_path):
 
 def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=None,
         gate2d=True, role_hold=ROLE_HOLD, mean_model=None, hinge_probe=False,
-        hinge_gate=False, conflict_probe=False):
+        hinge_gate=False, conflict_probe=False, gate_probe=False):
     routes   = routes_override or os.path.join(HERE, f"_cosim_routes_{flow}.rou.xml")
     net_path = os.path.join(HERE, "intersection.net.xml")
     if routes_override is None:
@@ -217,6 +217,9 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
     # conflict-gap probe: τ_c (= conflict_time_gap) over egos that actually have a valid
     # crossing rival, tracked over the whole run (min = closest call, max = loosest)
     tc_min, tc_max, tc_sum, tc_n = float("inf"), 0.0, 0.0, 0
+    # gate probe: per (yielder/passer in the junction window) the inequality gate's effect —
+    # (distance to junction, role, a BEFORE rollout_gate, a AFTER rollout_gate)
+    gate_log: list = []
     n_steps = int(T_END / DT)
 
     for step in range(n_steps):
@@ -364,8 +367,14 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
             force_roll = torch.tensor([roles_i[i] == 'pass'
                                        and role_mem.protected(vehs[i], t_now)
                                        for i in range(N)])
+            a_pre_gate = a.detach().clone()      # kernel command BEFORE the inequality gate
             a, defer = S.rollout_gate(a.detach(), s_front, vs, mv, yield_mask, geo, s_junc,
                                       return_defer=True, force_roll=force_roll)
+            if gate_probe:                       # rollout_gate's effect only (pre-FGD): Δa by role/dist
+                for i in range(N):
+                    if roles_i[i] in ("yield", "pass") and -30.0 < float(d_junc[i]) < 60.0:
+                        gate_log.append((float(d_junc[i]), roles_i[i],
+                                         float(a_pre_gate[i]), float(a[i])))
             # FGD polish: L2 functional-gradient descent on the 2-D hinge, AFTER the
             # role gate (box-exclusivity intact).  Can brake past the gate's −3 comfort
             # floor toward −B_MAX when a conflict is imminent — the extra authority the
@@ -447,6 +456,7 @@ def run(flow=500, seed=0, gui=False, realtime=False, track=(), routes_override=N
                 tau_c_min=(tc_min if tc_n else float("nan")),
                 tau_c_max=(tc_max if tc_n else float("nan")),
                 tau_c_mean=(tc_sum / tc_n if tc_n else float("nan")),
+                gate_log=gate_log,
                 collided_ids=sorted(collided))
 
 
