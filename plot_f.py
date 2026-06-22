@@ -133,6 +133,7 @@ def main():
     plot_style.apply()
     cmap_div = plt.get_cmap("RdBu").copy(); cmap_div.set_bad("0.82")   # blue=+ accel, red=− brake
     cmap_seq = plt.get_cmap("viridis").copy(); cmap_seq.set_bad("0.82")
+    POS, NEG = "#2ca02c", "#d62728"      # sign-scatter colors: green = f>0 (accel), red = f<0 (brake)
     sw = kernel_authority(r_val=0.0)
     X, Y = np.meshgrid(gbins, tbins)
 
@@ -165,19 +166,21 @@ def main():
         return
     npz = np.load(SRC); data = npz["data"]; flows = list(npz["flows"]); nseed = int(npz["nseed"])
     yld = data[:, 2] < 0.5                                   # YIELDER only
-    ma, _ = binned(data[yld, 0], data[yld, 1], data[yld, 3])  # most extreme f (max|f|, signed)
-    finite = np.abs(ma[np.isfinite(ma)])
-    vlim = VMAX if VMAX is not None else float(np.percentile(finite, 95))
-    print(f"f (yielder, {int(yld.sum())} collected samples): ±{vlim:.3f} "
-          f"(95th; max={finite.max():.3f})")
+    gy, ty, fy = data[yld, 0], data[yld, 1], data[yld, 3]
+    pos = fy > 0
+    print(f"f (yielder, {int(yld.sum())} samples): {int(pos.sum())} accel (f>0) / "
+          f"{int((~pos).sum())} brake (f<0)")
     fig, ax = plt.subplots(figsize=(8.5, 7), constrained_layout=True)
-    im0 = ax.pcolormesh(X, Y, np.ma.masked_invalid(ma).T, cmap=cmap_div,
-                        vmin=-vlim, vmax=vlim, shading="flat")
-    ax.set_title(r"Yielder ($\gamma_i$=0) — most extreme learned $f_i$ (max $|f_i|$, signed)" + "\n"
-                 f"from COLLECTED rollouts only  [{int(yld.sum())} samples, "
-                 r"flows " + f"{flows} × {nseed} seeds]  ·  blue=$a_i$>0, red=$a_i$<0, grey=uncovered")
-    fig.colorbar(im0, ax=ax, label=r"$f_i$ (m/s²)", extend="both")
-    decorate(ax, sw, boxes=False)
+    # RAW operating points, colored by SIGN of f; low alpha so context density darkens
+    ax.scatter(gy[pos],  ty[pos],  s=6, alpha=0.9, color=POS, edgecolors="none",
+               rasterized=True, label=r"$f_i>0$ (accel)")
+    ax.scatter(gy[~pos], ty[~pos], s=6, alpha=0.9, color=NEG, edgecolors="none",
+               rasterized=True, label=r"$f_i<0$ (brake)")
+    ax.set_title(r"Yielder ($\gamma_i$=0) — learned $f_i$ SIGN at real operating points" + "\n"
+                 f"[{int(yld.sum())} samples, flows {flows} × {nseed} seeds]  ·  "
+                 r"green=$a_i$>0 (accel), red=$a_i$<0 (brake)")
+    decorate(ax, sw, boxes=False, safety_line=True)
+    ax.legend(loc="upper right", markerscale=3, framealpha=0.9)
     out = os.path.join(OUT, "f_contour")
     plot_style.save(fig, out, dpi=130); print(f"saved {out}.png / .pdf")
 
@@ -186,26 +189,22 @@ def main():
     pm = data[:, 2] >= 0.5
     if pm.sum() > 0:
         gp, fp = data[pm, 0], data[pm, 3]
-        gi = np.clip(np.digitize(gp, gbins) - 1, 0, NB_G - 1)
-        mean_f = np.full(NB_G, np.nan); maxabs_f = np.full(NB_G, np.nan)
-        for b in range(NB_G):
-            sel = gi == b
-            if sel.any():
-                vals = fp[sel]
-                mean_f[b] = vals.mean()
-                maxabs_f[b] = vals[np.abs(vals).argmax()]      # max |f|, signed
+        ppos = fp > 0
         figf, axf = plt.subplots(figsize=(9, 5), constrained_layout=True)
         axf.axhline(0, color="k", lw=0.6)
-        axf.scatter(gp, fp, s=4, alpha=0.12, color="gray", label="samples (context spread)")
-        axf.plot(gc, mean_f, "-o", ms=3, color=plot_style.BLUE, label=r"mean $f_i$")
-        axf.plot(gc, maxabs_f, "-s", ms=3, color=plot_style.PINK, label=r"max $|f_i|$ (signed)")
+        # RAW samples only, colored by SIGN; low alpha so overlap darkens where the
+        # context spread piles up (no mean / max summary lines)
+        axf.scatter(gp[ppos],  fp[ppos],  s=6, alpha=0.9, color=POS,
+                    edgecolors="none", rasterized=True, label=r"$f_i>0$ (accel)")
+        axf.scatter(gp[~ppos], fp[~ppos], s=6, alpha=0.9, color=NEG,
+                    edgecolors="none", rasterized=True, label=r"$f_i<0$ (brake)")
         for x in utils._G_LEVELS:
             axf.axvline(x, color="k", lw=0.3, alpha=0.2)
         axf.axvline(1.0, color=plot_style.GREEN, lw=0.8, ls="--", alpha=0.6)   # g=1 equilibrium
         axf.set_xlabel(r"$g_i$  (gap ratio)"); axf.set_ylabel(r"$f_i$  (m/s²)")
         axf.set_xlim(0, utils.G_MAX); axf.set_title(
             r"Passer ($\gamma_i$=1)  $f_i$ vs $g_i$   (all passers at $\tau_i\approx$7.31)   "
-            f"[{int(pm.sum())} samples, flows {flows} × {nseed} seeds]   blue=accel, below 0=brake")
+            f"[{int(pm.sum())} samples, flows {flows} × {nseed} seeds]")
         axf.legend(); plot_style.despine(axf)
         outf = os.path.join(OUT, "passer_f")
         plot_style.save(figf, outf, dpi=130); print(f"saved {outf}.png / .pdf")

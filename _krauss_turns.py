@@ -20,8 +20,8 @@ mv_of_route = {(m.frm, m.to): m.idx for m in mv}
 DIRNAME = {m.idx: m.dir for m in mv}
 
 
-def run(seed):
-    R.write_turn_routes(routes, {"l": 200.0, "s": 300.0, "r": 200.0})  # match run_turns l=200 s=300 r=200
+def run(seed, vph=None):
+    R.write_turn_routes(routes, vph or {"l": 200.0, "s": 300.0, "r": 200.0})
     traci.start([sumolib.checkBinary("sumo"), "-n", net, "-r", routes, "--begin", "0",
                  "--end", str(T_END), "--step-length", str(DT), "--seed", str(seed),
                  "--no-step-log", "true", "--no-warnings", "true",
@@ -30,11 +30,18 @@ def run(seed):
     n_steps = int(T_END / DT)
     arrived = []; collided = set()
     mv_of = {}; dep = defaultdict(int); arr = defaultdict(int)
+    prev_speed, sum_a2, n_a2 = {}, 0.0, 0     # realized accel energy a = Δv/DT (same metric as run_turns)
     for step in range(n_steps):
         for v in traci.simulation.getDepartedIDList():
             r = traci.vehicle.getRoute(v)
             mv_of[v] = mv_of_route.get((r[0], r[-1]), 0); dep[mv_of[v]] += 1
         traci.simulationStep()
+        for v in traci.vehicle.getIDList():
+            sp = traci.vehicle.getSpeed(v)
+            if v in prev_speed:
+                a = (sp - prev_speed[v]) / DT
+                sum_a2 += a * a; n_a2 += 1
+            prev_speed[v] = sp
         arrived.append(traci.simulation.getArrivedNumber())
         for v in traci.simulation.getArrivedIDList():
             if v in mv_of: arr[mv_of[v]] += 1
@@ -46,7 +53,8 @@ def run(seed):
     for m in range(len(mv)):
         dd[DIRNAME[m]] += dep[m]; ad[DIRNAME[m]] += arr[m]
     served = {d: (ad[d], dd[d]) for d in ("s", "l", "r")}
-    return dict(vph=ss, arrived=int(np.sum(arrived)), collided=len(collided), served=served)
+    return dict(vph=ss, arrived=int(np.sum(arrived)), collided=len(collided), served=served,
+                energy=(sum_a2 / n_a2 if n_a2 else float("nan")))
 
 
 if __name__ == "__main__":

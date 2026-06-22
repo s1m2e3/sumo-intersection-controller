@@ -25,23 +25,26 @@ FLOWS = [int(x) for x in args[1].split(",")] if len(args) > 1 else [500, 600, 70
 
 
 def load_model():
-    last = os.path.join(HERE, "mean_net_last.pt")       # saved every epoch by train_mean
-    best = os.path.join(HERE, "mean_net_ckpt.pt")       # best-by-score
-    # default LATEST (where training ended up); else BEST.  Skip any checkpoint with
-    # non-finite weights (a diverged run leaves NaN/Inf → would harvest NaN f).
+    # ARCH-TAGGED checkpoints for the ACTIVE architecture (mean_net.ARCH), built with
+    # make_mean_model() — so this tracks the current model (mlp_ctx), not the legacy
+    # transformer.  default LATEST (where training ended up); else BEST.  Skip any
+    # checkpoint with non-finite weights (a diverged run leaves NaN/Inf → NaN f).
     import mean_net
+    last = os.path.join(HERE, mean_net.ckpt_path("last"))   # saved every epoch by train_mean
+    best = os.path.join(HERE, mean_net.ckpt_path("best"))   # best-by-loss
     order = [best, last] if USE_BEST else [last, best]
     for path in order:
         if not os.path.exists(path):
             continue
         ck = torch.load(path, weights_only=True)
         sd = ck["state_dict"] if isinstance(ck, dict) and "state_dict" in ck else ck
-        m = mean_net.MeanTransformer(); m.load_state_dict(sd); m.eval()
+        m = mean_net.make_mean_model(); m.load_state_dict(sd); m.eval()
         if all(torch.isfinite(p).all() for p in m.parameters()):
-            print(f"loaded model: {os.path.basename(path)}")
+            print(f"loaded model: {os.path.basename(path)}  (arch={mean_net.ARCH})")
             return m
         print(f"  ({os.path.basename(path)} has non-finite weights (diverged) — skipping)")
-    sys.exit("no usable checkpoint (mean_net_last.pt / mean_net_ckpt.pt) — train first.")
+    sys.exit(f"no usable checkpoint ({mean_net.ckpt_path('last')} / "
+             f"{mean_net.ckpt_path('best')}) — train first.")
 
 
 def main():
@@ -56,7 +59,9 @@ def main():
             if log:
                 rows.append(torch.cat(log, dim=0))      # [steps*Na, 4]
             print(f"  flow={flow} seed={seed:2d}  samples={n}", flush=True)
-    data = torch.cat(rows, dim=0).numpy()               # [N, 4] = g, τ_c, r, f
+    # harvest rows are [g, τ_c, r, p, f, da, a_zero] (feat is now 4-wide incl. promote p);
+    # keep the (g, τ_c, r, f) columns plot_f.py expects (f at index 3)
+    data = torch.cat(rows, dim=0).numpy()[:, [0, 1, 2, 4]]   # [N, 4] = g, τ_c, r, f
     path = os.path.join(OUT, "f_samples.npz")
     np.savez(path, data=data, flows=FLOWS, nseed=NSEED)
     f = data[:, 3]

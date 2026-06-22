@@ -34,7 +34,7 @@ def main():
     # (0,0) throughput / objective
     a = ax[0, 0]
     a.plot(ep, d["mean_J"], "-o", ms=3, color=plot_style.BLUE,   label="mean J̄ (throughput)")
-    a.plot(ep, d["score"],  "-s", ms=3, color=plot_style.ORANGE, label="score (J̄ − λ_s·hinge)")
+    a.plot(ep, d["loss"],   "-s", ms=3, color=plot_style.ORANGE, label="joint loss L (λ_C·⟨a²⟩ − λ_V·J̄)")
     a.set_title("Objective / throughput"); a.set_xlabel("epoch"); a.legend()
 
     # (0,1) safety hinge
