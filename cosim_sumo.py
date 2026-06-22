@@ -1,10 +1,13 @@
 """
 cosim_sumo.py — single entry point for intersection simulation.
 
-Two controller modes (controller= CLI arg):
+Three controller modes (controller= CLI arg):
   kernel   OUR GP signal-phase kernel (utils.SignalController).  SUMO is a
            black-box dynamics engine (speedMode=0); all yield/stop/role logic
            is ours and differentiable.
+  nn       PhaseNet adaptive signal controller — loads signal_nn_best.pt (or
+           model=<path>); drives cycle timing with the trained NN, otherwise
+           identical to kernel mode (speedMode=0, our gap/yield logic).
   sumo     SUMO's own fixed-time signal controller (intersection_tl.net.xml).
            No TraCI speed override — pure Krauss baseline for comparison.
 
@@ -13,7 +16,7 @@ Geometry is loaded from turns_geom and passed to the controller — swap the
 net file to run on a different intersection without touching utils.py.
 
     conda run -n car-following-sumo python cosim_sumo.py \\
-        [controller=kernel|sumo] [s=<vph>] [l=<vph>] [r=<vph>] \\
+        [controller=kernel|nn|sumo] [model=<ckpt>] [s=<vph>] [l=<vph>] [r=<vph>] \\
         [seed=<n>] [gui] [speed=<x>] [end=<s>] [gridlock_s=<s>] [log=<path>]
 """
 import os, sys, time, json, datetime
@@ -119,7 +122,7 @@ def write_routes(path, vph, net_path):
 # ── simulation runner ─────────────────────────────────────────────────────────
 
 def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
-        controller="kernel", gridlock_s=40.0, logfile=None):
+        controller="kernel", nn_model=None, gridlock_s=40.0, logfile=None):
     """
     Run the intersection simulation.
 
@@ -130,7 +133,9 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
         gui_speed    GUI playback speed (>1 = faster than real-time)
         t_end        simulation end time in seconds  (default T_END=120)
         controller   'kernel'  our GP signal-phase controller (differentiable)
+                     'nn'      PhaseNet adaptive controller (loads checkpoint)
                      'sumo'    SUMO's own fixed-time TL (Krauss baseline)
+        nn_model     path to PhaseNet checkpoint (default: signal_nn_best.pt)
         gridlock_s   stop if no arrivals for this many seconds  (0 = disabled)
         logfile      append one JSON result line to this file
 
@@ -142,9 +147,9 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
     vph    = vph or {"s": 200, "l": 100, "r": 100}
     _t_end = t_end or T_END
 
-    # net selection: kernel mode uses the no-TL net (we control everything);
+    # net selection: kernel/nn use the no-TL net (we control everything);
     # sumo mode uses the TL net so SUMO enforces signal phases itself.
-    if controller == "kernel":
+    if controller in ("kernel", "nn"):
         net_path = os.path.join(HERE, "intersection.net.xml")
     else:
         net_path = os.path.join(HERE, "intersection_tl.net.xml")
@@ -158,9 +163,10 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
     mv_of_route = {(m.frm, m.to): m.idx for m in mv}
     DIRNAME     = {m.idx: m.dir for m in mv}
 
-    # kernel-mode geometry: conflict matrix + arc-lengths + merge conflicts
-    ctrl = None
-    if controller == "kernel":
+    # kernel/nn-mode geometry: conflict matrix + arc-lengths + merge conflicts
+    ctrl     = None
+    s_junc_g = None
+    if controller in ("kernel", "nn"):
         _geo, _s_cp, s_junc_g, CONF = G.gate_geometry(net_path)
         AX = torch.tensor([m.axis for m in mv])
         SG = torch.tensor([m.sgn  for m in mv])
@@ -170,6 +176,30 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
                 if _i != _j and mv[_i].frm != mv[_j].frm and mv[_i].to == mv[_j].to:
                     CONF[_i, _j] = True   # add merge conflicts (same exit road)
         ctrl = utils.SignalController(conf=CONF, s_junc=s_junc_g)
+
+    # nn-mode: load PhaseNet checkpoint
+    nn_net = None
+    if controller == "nn":
+        import signal_nn as SN
+        _model_path = nn_model or SN.BEST_CKPT
+        if os.path.exists(_model_path):
+            _ckpt = torch.load(_model_path, map_location="cpu", weights_only=True)
+            _arch = _ckpt.get("arch", {})
+            if "n_in" not in _arch:
+                _arch["n_in"] = int(_ckpt["model"]["embed.0.weight"].shape[1])
+            _arch.setdefault("hidden",  32)
+            _arch.setdefault("n_heads", 2)
+            _arch.setdefault("n_layers", 1)
+            nn_net = SN.PhaseNet(**_arch).to(torch.device("cpu"))
+            nn_net.load_state_dict(_ckpt["model"])
+            print(f"  [nn] Loaded {_model_path!r}  "
+                  f"epoch={_ckpt.get('epoch','?')}  loss={_ckpt.get('loss',float('nan')):.1f}"
+                  f"  arch={_arch}")
+        else:
+            import signal_nn as SN
+            print(f"  [nn] WARNING: no checkpoint at {_model_path!r} — random weights")
+            nn_net = SN.PhaseNet(hidden=32, n_heads=2, n_layers=1).to(torch.device("cpu"))
+        nn_net.eval()
 
     sumo_bin = sumolib.checkBinary("sumo-gui" if gui else "sumo")
     cmd = [sumo_bin, "-n", net_path, "-r", routes,
@@ -194,6 +224,12 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
     n_steps  = int(_t_end / DT)
     configured, mv_idx, exited = set(), {}, set()
     arrived, collided = [], set()
+
+    # nn-mode cycle state: default timing used during warm-up, NN takes over after WARMUP_T
+    if controller == "nn":
+        _nn_c, _nn_e = SN.cycle_boundaries(SN._DEFAULT_T, 0.0)
+        _nn_cycle_end = float(_nn_e[-1].item()) + SN.T_AR
+        _nn_active    = False
     dep_dir = {d: 0 for d in "slr"}
     arr_dir = {d: 0 for d in "slr"}
     _no_arrival_steps = 0
@@ -207,7 +243,7 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
 
         for v in ids:
             if v not in configured:
-                if controller == "kernel":
+                if controller in ("kernel", "nn"):
                     traci.vehicle.setSpeedMode(v, 0)
                     traci.vehicle.setLaneChangeMode(v, 0)
                 traci.vehicle.subscribe(v, (tc.VAR_SPEED, tc.VAR_DISTANCE,
@@ -237,7 +273,7 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
         _DBG["N_max"]     = max(_DBG["N_max"],     N)
         _DBG["inbox_max"] = max(_DBG["inbox_max"], sum(on_box))
 
-        if controller == "kernel":
+        if controller in ("kernel", "nn"):
             d_junc = s_junc_g[mvi_t] - s_front
 
             # release deep-past-box vehicles to SUMO car-following
@@ -265,7 +301,33 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
                         v_lead[i] = float(vs[j])
 
             t_now = step * DT
-            a, info = ctrl.step(vehs, mvi_t, vs, gap, v_lead, d_junc, on_box, t_now)
+
+            # nn-mode: determine current green from NN-driven cycle
+            if controller == "nn":
+                if not _nn_active and t_now >= SN.WARMUP_T:
+                    _nn_active = True
+                    with torch.no_grad():
+                        feat  = SN.phase_features(s_front, vs, mvi_t, s_junc_g)
+                        T_all = nn_net(feat[:, :_arch["n_in"]])
+                    _nn_c, _nn_e = SN.cycle_boundaries(T_all, t_now)
+                    _nn_cycle_end = float(_nn_e[-1].item()) + SN.T_AR
+                elif _nn_active and t_now >= _nn_cycle_end:
+                    with torch.no_grad():
+                        feat  = SN.phase_features(s_front, vs, mvi_t, s_junc_g)
+                        T_all = nn_net(feat[:, :_arch["n_in"]])
+                    _nn_c, _nn_e = SN.cycle_boundaries(T_all, _nn_cycle_end)
+                    _nn_cycle_end = float(_nn_e[-1].item()) + SN.T_AR
+
+                nn_green_override = frozenset()
+                for _k in range(SN.N_PHASES):
+                    if float(_nn_c[_k]) <= t_now < float(_nn_e[_k]):
+                        nn_green_override = SN._PHASE_GREEN[_k]
+                        break
+            else:
+                nn_green_override = None
+
+            a, info = ctrl.step(vehs, mvi_t, vs, gap, v_lead, d_junc, on_box, t_now,
+                                green_override=nn_green_override)
             is_yield  = info["is_yield"]
             yield_cap = info["yield_cap"]
             box_cap   = info["box_cap"]
@@ -304,7 +366,7 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
                         "id": cv,
                         "mv": f"{mv[int(mvi_t[i])].frm}.{DIRNAME[int(mvi_t[i])]}",
                         "v":  round(float(vs[i]), 2),
-                        "d":  round(float(d_junc[i]) if controller == "kernel" else 0.0, 1),
+                        "d":  round(float(d_junc[i]) if controller in ("kernel", "nn") else 0.0, 1),
                         "box": int(on_box[i]),
                     })
             parts = [f"{r['id']}[{r.get('mv','?')} d={r.get('d','?')} "
@@ -365,6 +427,7 @@ if __name__ == "__main__":
         return t.split("=", 1)[1] if t is not None else default
 
     controller = _tok("controller=", "kernel")
+    nn_model   = _tok("model=", None)
     gui        = "gui" in tokens
     gui_speed  = float(_tok("speed=", 3.0))
     seed       = int(_tok("seed=", next((t for t in tokens if t.isdigit()), "0")))
@@ -379,7 +442,8 @@ if __name__ == "__main__":
     logfile    = _tok("log=", None)
 
     r = run(vph=vph, seed=seed, gui=gui, gui_speed=gui_speed, t_end=t_end,
-            controller=controller, gridlock_s=gridlock_s, logfile=logfile)
+            controller=controller, nn_model=nn_model,
+            gridlock_s=gridlock_s, logfile=logfile)
 
     print(f"\nCOSIM  L/S/R={vph['l']:.0f}/{vph['s']:.0f}/{vph['r']:.0f} vph/approach"
           f"  seed={seed}  controller={controller}:")

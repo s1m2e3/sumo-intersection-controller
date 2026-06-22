@@ -674,13 +674,14 @@ def build_turn_geometry(net_path=NET_PATH):
     return geo, s_cp, path_len, s_junc, CONF, list(range(M))
 
 
-def gen_turn_events(vph, seed):
+def gen_turn_events(vph, seed, t_end=None):
     """Poisson schedule over the 12 turn movements at per-direction demand
     vph={'l','s','r'} (vph/approach) — the PyTorch analogue of run_turns.write_turn_routes.
     A direction with demand 0 emits no vehicles (so vph={'l':0,'s':N,'r':0} is straight)."""
     import turns_geom as G
-    vph = vph or {"l": 100.0, "s": 300.0, "r": 100.0}
-    rng = np.random.default_rng(seed)
+    vph    = vph or {"l": 100.0, "s": 300.0, "r": 100.0}
+    t_end  = t_end or T_END
+    rng    = np.random.default_rng(seed)
     events = []
     for m in G.movements(NET_PATH):
         rate = float(vph[m.dir]) / 3600.0
@@ -689,7 +690,7 @@ def gen_turn_events(vph, seed):
         t = 0.0
         while True:
             t += rng.exponential(1.0 / rate)
-            if t >= T_END:
+            if t >= t_end:
                 break
             events.append((t, m.idx))
     events.sort()

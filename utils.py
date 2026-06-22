@@ -76,32 +76,37 @@ _SQRT_AB = math.sqrt(A_MAX * B_MAX)   # for the IDM closing term
 # ARD Matérn-1/2 length-scales, one per feature axis (g, τ_c, r).  ℓ_r is small so the
 # two ROLE columns (yield/pass) are nearly independent — role acts as a near-hard switch,
 # not a quantity to interpolate across.
-LENGTHSCALES = (0.5, 0.3)              # (ℓ_g, ℓ_r) — 2-D kernel, no τ_c axis
+LENGTHSCALES = (0.5, 0.3, 0.3)         # (ℓ_g, ℓ_r, ℓ_opp) — 3-D kernel
 GP_JITTER    = 1e-6
 
-# 2-D anchor grid in (g, r) space.  r ∈ {0=YIELDER, 1=PASSER}.
-# τ_c is removed: signal phases guarantee that all same-phase vehicles are geometrically
-# compatible, so there is no cross-conflict timing to reason about.  The kernel is purely
-# car-following (g-axis) gated by the signal-phase role (r-axis).
+# 3-D anchor grid in (g, r, opp) space.
+#   r   ∈ {0=YIELDER, 1=PASSER}      — signal-phase role (near-hard switch, ℓ_r small)
+#   opp ∈ {0=no-gap, 1=gap-cleared}  — opportunistic flag (near-hard switch, ℓ_opp small)
+# At opp=0 the grid is identical to the original 2-D (g,r) kernel — zero behaviour change.
+# At opp=1, r=0, g≥1: target='free' — gap-certified non-active-phase leader proceeds.
 #   'brake' → a_brake (≤0, saturating)   'free' → a_free(v) (positive)
 #   float   → constant accel (0.0 = HOLD)
 _G_LEVELS    = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
-_ROLE_LEVELS = (0.0, 1.0)        # 0 = YIELDER, 1 = PASSER
+_ROLE_LEVELS = (0.0, 1.0)        # 0 = YIELDER,  1 = PASSER
+_OPP_LEVELS  = (0.0, 1.0)        # 0 = no-gap,   1 = gap-cleared (opportunistic)
 
 
-def _anchor_target(g: float, r: float):
+def _anchor_target(g: float, r: float, opp: float):
     if g < 1.0:
-        return "brake"   # car-following safety — both roles
+        return "brake"           # car-following safety — all roles
     if g == 1.0:
-        return 0.0       # HOLD at desired gap — both roles
-    # g ≥ 2 (room ahead):
-    if r >= 0.5:
-        return "free"    # PASSER: free-flow
-    return 0.0           # YIELDER: hold speed (yield_cap enforces stop at junction)
+        return 0.0               # HOLD at desired gap — all roles
+    # g > 1.0 (room ahead):
+    if r >= 0.5 or opp >= 0.5:
+        return "free"            # PASSER or gap-cleared OPP: free-flow
+    return 0.0                   # YIELDER without gap: hold (yield_cap enforces stop)
 
 
-ANCHOR_FEATS   = tuple((g, r) for g in _G_LEVELS for r in _ROLE_LEVELS)
-ANCHOR_TARGETS = tuple(_anchor_target(g, r) for g, r in ANCHOR_FEATS)   # [M=24]
+ANCHOR_FEATS   = tuple((g, r, opp)
+                       for g   in _G_LEVELS
+                       for r   in _ROLE_LEVELS
+                       for opp in _OPP_LEVELS)
+ANCHOR_TARGETS = tuple(_anchor_target(g, r, opp) for g, r, opp in ANCHOR_FEATS)  # [M=48]
 
 
 def set_delta_safe(value):
@@ -514,6 +519,7 @@ def gp_posterior(feat, anchors, targets, ls, jitter=GP_JITTER,
 def controller_acceleration(
     x_ego, x_lead, v_ego, v_lead,
     role=None,               # [N] float: 1=passer (green), 0=yielder (red). None → all pass.
+    opp=None,                # [N] float: 1=gap-cleared opportunistic. None → all zero.
     length=L_VEH,
     lengthscales=LENGTHSCALES,
     a_prev=None, kappa=1.0, brake_exempt=True,
@@ -549,9 +555,10 @@ def controller_acceleration(
 
     # Role r ∈ {0=YIELDER, 1=PASSER} comes directly from the signal phase assignment.
     # 1 = green phase (pass, free-flow);  0 = red phase (yield, stop at junction).
-    r_feat = torch.ones_like(g) if role is None else role.to(g.dtype)
+    r_feat   = torch.ones_like(g) if role is None else role.to(g.dtype)
+    opp_feat = torch.zeros_like(g) if opp  is None else opp.to(g.dtype)
 
-    feat    = torch.stack([g, r_feat], dim=-1)                   # [..., 2]
+    feat     = torch.stack([g, r_feat, opp_feat], dim=-1)         # [..., 3]
     anchors = torch.tensor(ANCHOR_FEATS, dtype=feat.dtype, device=feat.device)
     ls      = torch.tensor(lengthscales, dtype=feat.dtype, device=feat.device)
 
@@ -607,6 +614,113 @@ for _d in SIGNAL_PHASE_DURS:
     _c += _d
     _SIGNAL_CUM.append(_c)
 
+# Non-all-red phase sets in cycle order — used by compute_opp_flags
+_GREEN_PHASE_SETS = [p for p in SIGNAL_PHASES if p]   # 4 frozensets
+
+# Opportunistic-movement physical constants
+_OPP_ETA_A_MAX  = 2.0    # m/s²  free-flow accel used for leader ETA estimate
+_OPP_ETA_RANGE  = 100.0  # m     look-ahead distance for approaching vehicles
+_OPP_D_CONFLICT = 10.0   # m     past stop bar to approximate conflict point
+_OPP_GAP_MIN    = 3.0    # s     minimum certified gap each side for passage
+
+
+def compute_opp_flags(green_mvs, mvi: torch.Tensor, vs: torch.Tensor,
+                      d_junc: torch.Tensor) -> torch.Tensor:
+    """Opportunistic flag [N] — 1.0 for the leader of each non-active phase
+    whose free-flow ETA to the conflict point falls in a ≥_OPP_GAP_MIN s gap
+    in the active-phase traffic stream.
+
+    green_mvs  frozenset   currently active green movement set
+    mvi        [N] int     movement index per vehicle
+    vs         [N] float   speed (m/s)
+    d_junc     [N] float   distance to junction (>0 approaching, <0 past)
+
+    Returns a plain float tensor — no autograd involvement.
+    """
+    N   = len(mvi)
+    opp = torch.zeros(N)
+    if not green_mvs:
+        return opp   # all-red
+
+    mvi_list  = mvi.tolist()
+    in_active = torch.tensor([int(m) in green_mvs for m in mvi_list], dtype=torch.bool)
+
+    # Free-flow kinematic ETAs of active-phase vehicles to the conflict point.
+    # Use the same accelerating estimator as pass-1 (not constant-speed) so that
+    # a just-spawned active vehicle at v≈0 gets its realistic minimum arrival time
+    # (~21 s from d=200 m) rather than the constant-speed 2100 s that would let
+    # an opp candidate slip through a false gap.
+    if in_active.any():
+        eta_active = []
+        for _dc, _vc in zip(
+                (d_junc[in_active] + _OPP_D_CONFLICT).clamp(min=0.0).tolist(),
+                vs[in_active].clamp(min=0.0).tolist()):
+            _a  = _OPP_ETA_A_MAX
+            _da = max(0.0, (V0 ** 2 - _vc ** 2) / (2.0 * _a))
+            if _dc <= _da:
+                eta_active.append(
+                    (-_vc + math.sqrt(max(_vc ** 2 + 2.0 * _a * _dc, 0.0))) / _a)
+            else:
+                eta_active.append((V0 - _vc) / _a + (_dc - _da) / V0)
+    else:
+        eta_active = []
+
+    # Pass 1: collect candidates — (veh_idx, eta_at_conflict, queue_size)
+    candidates = []
+    for phase_set in _GREEN_PHASE_SETS:
+        if phase_set & green_mvs:
+            continue
+        in_phase = torch.tensor([int(m) in phase_set for m in mvi_list], dtype=torch.bool)
+        appr     = in_phase & (d_junc > 0.0) & (d_junc < _OPP_ETA_RANGE)
+        if not appr.any():
+            continue
+
+        appr_idx = appr.nonzero().flatten()
+        d_appr   = d_junc[appr]
+        v_appr   = vs[appr]
+        loc      = int(d_appr.argmin())
+        d_lead   = float(d_appr[loc])
+        v_lead_  = float(v_appr[loc])
+        queue    = int(appr.sum())          # total approaching in this phase
+
+        d_conf  = d_lead + _OPP_D_CONFLICT
+        a       = _OPP_ETA_A_MAX
+        d_accel = max(0.0, (V0 ** 2 - v_lead_ ** 2) / (2.0 * a))
+        if d_conf <= d_accel:
+            t_eta = (-v_lead_ + math.sqrt(max(v_lead_ ** 2 + 2.0 * a * d_conf, 0.0))) / a
+        else:
+            t_eta = (V0 - v_lead_) / a + (d_conf - d_accel) / V0
+
+        candidates.append((int(appr_idx[loc]), t_eta, queue))
+
+    if not candidates:
+        return opp
+
+    # Pass 2: filter by active-phase gap (only the active stream as rivals here)
+    feasible = []
+    for veh_idx, eta_i, queue_i in candidates:
+        before = [eta_i - e for e in eta_active if e < eta_i]
+        after  = [e - eta_i for e in eta_active if e > eta_i]
+        if (not before or min(before) >= _OPP_GAP_MIN) and \
+           (not after  or min(after)  >= _OPP_GAP_MIN):
+            feasible.append((veh_idx, eta_i, queue_i))
+
+    # Pass 3: resolve inter-candidate conflicts by queue priority (greedy).
+    # Two feasible candidates conflict if their ETAs are within _OPP_GAP_MIN.
+    # Greedily pick the highest-queue candidate, grant it opp, remove it and
+    # every candidate that conflicts with it, repeat — at most one vehicle per
+    # conflicting cluster gets through.
+    n        = len(feasible)
+    conflict = [[abs(feasible[i][1] - feasible[j][1]) < _OPP_GAP_MIN
+                 for j in range(n)] for i in range(n)]
+    remaining = set(range(n))
+    while remaining:
+        best = max(remaining, key=lambda i: feasible[i][2])
+        opp[feasible[best][0]] = 1.0
+        remaining -= {best} | {j for j in remaining if conflict[best][j]}
+
+    return opp
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Signal-phase kernel controller
@@ -642,7 +756,8 @@ class SignalController:
 
     def step(self, vehs: list, mvi: torch.Tensor, vs: torch.Tensor,
              gap: torch.Tensor, v_lead: torch.Tensor,
-             d_junc: torch.Tensor, on_box: list, t: float):
+             d_junc: torch.Tensor, on_box: list, t: float,
+             green_override=None):
         """
         One simulation step — returns accelerations and diagnostic info.
 
@@ -663,18 +778,24 @@ class SignalController:
         N = len(vehs)
 
         # ── Signal phase → is_yield ──────────────────────────────────────────
-        _t_cyc = t % SIGNAL_CYCLE
-        _pidx  = next(k for k, cum in enumerate(_SIGNAL_CUM) if _t_cyc < cum)
-        _green = SIGNAL_PHASES[_pidx]
+        if green_override is not None:
+            _green = green_override          # NN-driven timing from caller
+        else:
+            _t_cyc = t % SIGNAL_CYCLE
+            _pidx  = next(k for k, cum in enumerate(_SIGNAL_CUM) if _t_cyc < cum)
+            _green = SIGNAL_PHASES[_pidx]
         is_yield = torch.tensor(
             [int(mvi[i]) not in _green for i in range(N)], dtype=torch.bool)
 
+        # ── Opportunistic flags (needed before committed tracking) ───────────
+        opp = compute_opp_flags(_green, mvi, vs, d_junc)
+
         # ── Committed-crosser tracking ───────────────────────────────────────
         # A vehicle is committed once SUMO places it on an internal lane (on_box)
-        # while its movement is green.  It keeps passer role to clear the box
+        # while green OR opportunistic.  It keeps passer role to clear the box
         # even if the phase switches before its arc-length d_junc crosses zero.
         for i, v in enumerate(vehs):
-            if on_box[i] and not bool(is_yield[i]):
+            if on_box[i] and (not bool(is_yield[i]) or bool(opp[i] > 0.5)):
                 self.committed.add(v)
         in_box = torch.tensor(
             [(vehs[i] in self.committed) or float(d_junc[i]) < 0.0
@@ -685,7 +806,7 @@ class SignalController:
         a_prev_t = torch.tensor([self.prev_a.get(v, 0.0) for v in vehs])
         a = controller_acceleration(
             torch.zeros(N), gap + L_VEH, vs, v_lead,
-            role=role, a_prev=a_prev_t, kappa=0.5,
+            role=role, opp=opp, a_prev=a_prev_t, kappa=0.5,
             brake_exempt=True, brake_floor=True)
         a = a.detach().clone()
 
@@ -710,7 +831,7 @@ class SignalController:
         # Committed crossers and vehicles already past the arc-length entry are exempt.
         yield_cap = torch.full((N,), float("inf"))
         for i in range(N):
-            if not bool(is_yield[i]) or vehs[i] in self.committed:
+            if not bool(is_yield[i]) or vehs[i] in self.committed or bool(opp[i] > 0.5):
                 continue
             _dj = float(d_junc[i])
             if _dj <= 0.0:
@@ -718,7 +839,7 @@ class SignalController:
             yield_cap[i] = (2.0 * B_MAX * max(_dj - STOP_OFFSET, 0.0)) ** 0.5
 
         for i in range(N):
-            if not bool(is_yield[i]) or vehs[i] in self.committed:
+            if not bool(is_yield[i]) or vehs[i] in self.committed or bool(opp[i] > 0.5):
                 continue
             _dj = float(d_junc[i])
             if _dj <= 0.0:
