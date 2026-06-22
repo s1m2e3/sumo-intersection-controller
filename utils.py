@@ -76,101 +76,32 @@ _SQRT_AB = math.sqrt(A_MAX * B_MAX)   # for the IDM closing term
 # ARD Matérn-1/2 length-scales, one per feature axis (g, τ_c, r).  ℓ_r is small so the
 # two ROLE columns (yield/pass) are nearly independent — role acts as a near-hard switch,
 # not a quantity to interpolate across.
-LENGTHSCALES = (0.5, 1.0, 0.3, 0.3)   # (ℓ_g, ℓ_τc in s, ℓ_r, ℓ_p) — ℓ_p small ⇒ the promotion
-                                 # sheets p=0/p=1 decouple (cross-sheet weight exp(−1/ℓ_p)≈0.04),
-                                 # so a vehicle reads the normal field at p=0 and the promotion
-                                 # (pass) field at p=1.  Below: (was 0.7/1.4) so the
-                                 # anchors' reach (their "radius" in the g–τ_c plane) is SMALLER:
-                                 # the posterior reverts to the PRIOR MEAN sooner between anchors,
-                                 # giving the learned mean f MORE room to operate (incl. the
-                                 # passer free-flow region).  With f≡0 this deepens the zero-
-                                 # reversion dips between anchors → re-validate the cosim baseline.
+LENGTHSCALES = (0.5, 0.3)              # (ℓ_g, ℓ_r) — 2-D kernel, no τ_c axis
 GP_JITTER    = 1e-6
 
-# 3-D anchor grid in (g, τ_c, r) space.  r ∈ {0 = YIELDER, 1 = PASSER}.  Targets are
-# sentinels resolved per-state:
-#   'brake' → a_brake (≤0),  'free' → a_free(v),  'clear' → a_max (passer asserts),
-#   'yield' → a_cross clamped ≤0 (yielder brakes to the stop-line),  float → constant.
-# The role axis SIGN-GATES the consequent: the PASSER column may accelerate (free/clear),
-# the YIELDER column is ≤0 everywhere (brake/HOLD) — a yielder on a clear road HOLDS and
-# waits its turn instead of free-flowing.  Dense brake ladder at low g (0.25, 0.5) keeps
-# the saturated a_brake anchor from diluting toward HOLD across g∈(0,1).
-# Denser g ladder (0.75, 1.25, 1.5, 2.5) through the active car-following band → sharper
-# reactivity to the longitudinal gap; τ_c gains a ½·δ_safe level for finer cross timing.
+# 2-D anchor grid in (g, r) space.  r ∈ {0=YIELDER, 1=PASSER}.
+# τ_c is removed: signal phases guarantee that all same-phase vehicles are geometrically
+# compatible, so there is no cross-conflict timing to reason about.  The kernel is purely
+# car-following (g-axis) gated by the signal-phase role (r-axis).
+#   'brake' → a_brake (≤0, saturating)   'free' → a_free(v) (positive)
+#   float   → constant accel (0.0 = HOLD)
 _G_LEVELS    = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
-_TAUC_EXTRA = (2.0, 5.5)         # extra τ_c anchor rows for denser interpolation support
-                                 # (2.0: more brake support in the yielder sub-δ_safe band /
-                                 #  blue for passers; 5.5: fills the passer blue between δ_safe
-                                 #  and TAU_C_MAX)
-def _tauc_levels(ds):
-    return tuple(sorted(set((0.0, 0.5 * ds, ds, TAU_C_MAX) + _TAUC_EXTRA)))
-_TAUC_LEVELS = _tauc_levels(DELTA_SAFE)
 _ROLE_LEVELS = (0.0, 1.0)        # 0 = YIELDER, 1 = PASSER
 
-_PROMO_LEVELS = (-1.0, 0.0, 1.0) # -1 = ANTI-PROMOTED (free-flow to the line, held there by the
-                                 #      gate — incompatible with the active phase),
-                                 #  0 = normal, 1 = PROMOTED (asserts through, drops cross yield)
 
-def _anchor_target(g: float, tc: float, r: float, p: float = 0.0):
-    if p <= -0.5:
-        # ANTI-PROMOTED: incompatible with the active promotion phase.  It must NOT freeze
-        # mid-road — it FREE-FLOWS toward the junction (keeping only its own car-following
-        # safety), and is halted AT the stop-line by the phase block / gate box-exclusivity.
-        # No cross-timing (τ_c) dependence and no 'clear' assert: it never enters the box.
-        if g < 1.0:
-            return "brake"                      # car-following safety (its own leader)
-        if g == 1.0:
-            return 0.0                          # HOLD at the desired gap (stable equilibrium)
-        return "free"                           # roll at free-flow up to the line
-    if p >= 0.5:
-        # PROMOTION: the role r is the LATCHED passer/yielder decided AMONG the promoted set
-        # (run_turns sorts by ETA and FORCES every in-box must-clear vehicle to PASS).  The
-        # cross-conflict is resolved only within that group — never against held/anti-promoted
-        # traffic.  Longitudinal safety is always kept: no gap (g<1) ⇒ it cannot push (brakes).
-        if g < 1.0:
-            return "brake"                      # no gap → can't push (rear-end safety kept)
-        if r >= 0.5:
-            # PROMOTED PASSER — asserts through, IGNORING cross timing τ_c (it holds right-of-way
-            # within the promoted group; its only constraint is the g<1 rear-end floor).
-            if tc == 0.0:
-                return "clear"                  # assert through the conflict point (a_max)
-            if g == 1.0:
-                return 0.0                      # HOLD at the desired gap — STABLE equilibrium.
-                                                # Without this the promoted column jumps brake(g<1)
-                                                # ↔ free(g≥1) with no fixed point, so a follower
-                                                # limit-cycles (gas/brake/gas/brake). Mirrors the
-                                                # normal column's g==1 HOLD anchor.
-            return "free"                       # g≥2 (room ahead) → free-flow
-        # PROMOTED YIELDER — latched behind an earlier promoted vehicle (typically an in-box
-        # must-clear passer it conflicts with): brake to arrive δ_safe behind it (a_cross), then
-        # HOLD once the margin opens.  Same shape as the normal yielder, but its rival set is the
-        # promoted subset only.  The latch releases (→ passer) once that vehicle clears its LAST
-        # conflict point, so the queue serializes through behind it rather than deadlocking.
-        if tc == 0.0:
-            return "yield"                      # at the conflict line, no margin → brake to it
-        if g == 1.0:
-            return 0.0                          # HOLD at the desired gap
-        return 0.0 if tc + 1e-9 >= DELTA_SAFE else "yield"
-    # p == 0 → normal behavior (unchanged)
+def _anchor_target(g: float, r: float):
     if g < 1.0:
-        return "brake"                          # longitudinal safety dominates for both roles
-    if tc == 0.0:
-        return "clear" if r >= 0.5 else "yield" # passer asserts & clears; yielder brakes to line
+        return "brake"   # car-following safety — both roles
     if g == 1.0:
-        return 0.0                              # HOLD at desired gap
+        return 0.0       # HOLD at desired gap — both roles
     # g ≥ 2 (room ahead):
     if r >= 0.5:
-        return "free"                           # PASSER: priority + room ⇒ free-flow at ANY τ_c>0
-                                                # (τ_c=0 handled above as 'clear'=a_max assert) —
-                                                # a passer always accelerates
-    # YIELDER: keep braking (cross-yield decel) as long as the conflict margin is unmet
-    # (τ_c < δ_safe) — it must actively open the gap, not just hold; once τ_c ≥ δ_safe the
-    # δ_safe margin is satisfied → HOLD at the desired spacing.
-    return 0.0 if tc + 1e-9 >= DELTA_SAFE else "yield"
+        return "free"    # PASSER: free-flow
+    return 0.0           # YIELDER: hold speed (yield_cap enforces stop at junction)
 
-ANCHOR_FEATS   = tuple((g, tc, r, p) for g in _G_LEVELS for tc in _TAUC_LEVELS
-                       for r in _ROLE_LEVELS for p in _PROMO_LEVELS)
-ANCHOR_TARGETS = tuple(_anchor_target(g, tc, r, p) for g, tc, r, p in ANCHOR_FEATS)   # [M]
+
+ANCHOR_FEATS   = tuple((g, r) for g in _G_LEVELS for r in _ROLE_LEVELS)
+ANCHOR_TARGETS = tuple(_anchor_target(g, r) for g, r in ANCHOR_FEATS)   # [M=24]
 
 
 def set_delta_safe(value):
@@ -182,12 +113,8 @@ def set_delta_safe(value):
     passes it on to free_flow_gate / cross_resolve_accel / resolve_cross_accel, so this
     one call retargets the whole conflict-resolution stack.  Call it ONCE at startup
     before the first controller_acceleration; δ_safe is expected in (0, TAU_C_MAX)."""
-    global DELTA_SAFE, _TAUC_LEVELS, ANCHOR_FEATS, ANCHOR_TARGETS
-    DELTA_SAFE     = float(value)
-    _TAUC_LEVELS   = _tauc_levels(DELTA_SAFE)
-    ANCHOR_FEATS   = tuple((g, tc, r, p) for g in _G_LEVELS for tc in _TAUC_LEVELS
-                           for r in _ROLE_LEVELS for p in _PROMO_LEVELS)
-    ANCHOR_TARGETS = tuple(_anchor_target(g, tc, r, p) for g, tc, r, p in ANCHOR_FEATS)
+    global DELTA_SAFE
+    DELTA_SAFE = float(value)
     _KINV_CACHE.clear()
     return DELTA_SAFE
 
@@ -586,41 +513,22 @@ def gp_posterior(feat, anchors, targets, ls, jitter=GP_JITTER,
 
 def controller_acceleration(
     x_ego, x_lead, v_ego, v_lead,
-    # cross-traffic (optional — omit for pure car-following)
-    d_conf=None, rival_d=None, rival_v=None, rival_valid=None,
-    ego_pressure=None, rival_pressure=None,
+    role=None,               # [N] float: 1=passer (green), 0=yielder (red). None → all pass.
     length=L_VEH,
     lengthscales=LENGTHSCALES,
     a_prev=None, kappa=1.0, brake_exempt=True,
-    brake_floor=True, predecessor=True,
-    pred_override=None,
-    promote=None,                       # [...] per-vehicle promotion flag p∈{-1,0,1} (None ⇒ all 0)
-    prio_ego=None, prio_rival=None,     # optional right-of-way priority bias (s), non-predecessor mode
-    cross_override=None,                # (earlier_override[...,K], override_mask[...]) latched who-yields
-                                        #   (non-predecessor mode) — promotion's frozen ETA assignment
-    return_roles=False,
+    brake_floor=True,
     return_feat=False,
-    mean_fn=None,
 ):
     """
-    2-D gap-ratio + conflict-time kernel controller.
+    2-D signal-phase kernel controller.
 
-        φ = (g, τ_c)
-        anchor targets: a_brake (g=0), 0 (HOLD), a_free(v) (FREE), a_cross (cross)
+        φ = (g, r)   g = gap-ratio to same-queue leader,  r = signal-phase role
+        anchor targets: 'brake' → a_brake(g),  0.0 → HOLD,  'free' → a_free(v)
         â = gp_posterior(φ, anchors, targets)
 
-    Cross-traffic args are [..., K] (per conflicting rival): rival_d/rival_v/
-    rival_valid plus d_conf = ego distance to each rival's crossing point ([..., K]
-    for per-pair conflict points, or a [...] scalar for the centre approximation).
-    When omitted, τ_c = TAU_C_MAX and the controller reduces to pure car-following.
-
-    pred_override (predecessor mode only): a precomputed
-    (τ_c, eta_pred, ego_d_pred, v_pred, has_pred, is_pred) tuple from the caller's
-    STATE-ESTIMATION step.  When given, the internal predecessor_gap proposal is skipped
-    and these resolved values are used instead — this is how the stateful priority memory
-    (role latch, 50 m assignment, stuck→pass, platoon priority) is injected: the role is
-    decided where states are estimated, and the kernel just consumes it.
-
+    role: per-vehicle float tensor — 1.0 = green (passer, free-flow), 0.0 = red (yielder,
+    hold speed; yield_cap in the caller enforces the stop at the junction stop-line).
     Angle-2 damping (optional): first-order lag a_cmd = a_prev + κ(â−a_prev),
     bypassed when braking harder than a_prev if brake_exempt.
 
@@ -639,77 +547,23 @@ def controller_acceleration(
     a_brake = brake_to_recover(x_ego, x_lead, v_ego, v_lead, length)
     a_free  = free_flow_accel(v_ego)
 
-    is_pred = None   # per-pair yield mask (who ego must yield to), for return_roles
-    if rival_d is None:
-        tau_c    = torch.full_like(g, TAU_C_MAX)
-        a_cross  = torch.zeros_like(g)
-        any_cross = torch.zeros_like(g, dtype=torch.bool)
-        has_pred  = torch.zeros_like(g, dtype=torch.bool)   # no cross → PASSER (free)
-    elif predecessor:
-        # virtual single-file queue: cross feature = arrival gap to the predecessor;
-        # the cross anchor is yield-to-predecessor (no pass branch — leaders free-flow).
-        # If the caller resolved the role in its state step, consume that; else propose here.
-        if pred_override is not None:
-            tau_c, eta_pred, ego_d_pred, v_pred, has_pred, is_pred = pred_override
-        else:
-            tau_c, eta_pred, ego_d_pred, v_pred, has_pred, is_pred = predecessor_gap(
-                d_conf, v_ego, rival_d, rival_v, rival_valid,
-                delta_safe=DELTA_SAFE, ego_P=ego_pressure, rival_P=rival_pressure)
-        a_cross   = cross_resolve_accel(ego_d_pred, v_ego, eta_pred, tau_c,
-                                        delta_safe=DELTA_SAFE)
-        a_cross   = torch.where(has_pred, a_cross, torch.zeros_like(a_cross))
-        any_cross = rival_valid.any(dim=-1)
-    else:
-        tau_c, delta_w, eta_w, any_rival, ego_d_sel, v_rival_sel = conflict_time_gap(
-            d_conf, v_ego, rival_d, rival_v, rival_valid)
-        _eov, _omask = (cross_override if cross_override is not None else (None, None))
-        a_cross, must_yield = resolve_cross_accel(
-            d_conf, v_ego, rival_d, rival_v, rival_valid, delta_safe=DELTA_SAFE,
-            prio_ego=prio_ego, prio_rival=prio_rival,
-            earlier_override=_eov, override_mask=_omask)
-        eta_pred, ego_d_pred, v_pred, has_pred, any_cross = (
-            eta_w, ego_d_sel, v_rival_sel, must_yield, any_rival)
+    # Role r ∈ {0=YIELDER, 1=PASSER} comes directly from the signal phase assignment.
+    # 1 = green phase (pass, free-flow);  0 = red phase (yield, stop at junction).
+    r_feat = torch.ones_like(g) if role is None else role.to(g.dtype)
 
-    # ROLE feature r ∈ {0=YIELDER, 1=PASSER}, derived from the resolved yield decision.
-    # has_pred=True (yielding) → r=0 (brake/HOLD column); else → r=1 (free/clear column).
-    # cosim's queue/latch memory sets has_pred upstream, so the queue promotion (yield→pass)
-    # flips the whole role column here.
-    r_feat = torch.where(has_pred, torch.zeros_like(g), torch.ones_like(g))
-    # PROMOTION feature p ∈ {-1,0,1}: the kernel's 4th axis.  p=1 anchors prescribe pass/clear
-    # (cross yield dropped, g<1 brake kept); p=-1 (anti-promoted) prescribes free-flow-to-the-line
-    # with no cross/clear; p=0 is the normal column — see _anchor_target.
-    p_feat = torch.zeros_like(g) if promote is None else promote.to(g.dtype)
-
-    feat = torch.stack([g, tau_c, r_feat, p_feat], dim=-1)     # [..., 4]
+    feat    = torch.stack([g, r_feat], dim=-1)                   # [..., 2]
     anchors = torch.tensor(ANCHOR_FEATS, dtype=feat.dtype, device=feat.device)
-    ls = torch.tensor(lengthscales, dtype=feat.dtype, device=feat.device)
+    ls      = torch.tensor(lengthscales, dtype=feat.dtype, device=feat.device)
 
-    # role-sign-gated consequents: PASSER may accelerate (free / clear=a_max); YIELDER is ≤0
-    # (a_yield = the cross/stop-line decel clamped non-positive — a yielder never accelerates).
-    a_clear = torch.full_like(a_brake, A_MAX)
-    a_yield = a_cross.clamp(max=0.0)
-    _resolve = {"brake": a_brake, "free": a_free, "clear": a_clear, "yield": a_yield}
+    _resolve = {"brake": a_brake, "free": a_free}
     target_cols = [
         _resolve[s] if isinstance(s, str) else torch.full_like(a_brake, float(s))
         for s in ANCHOR_TARGETS
     ]
-    targets = torch.stack(target_cols, dim=-1)                 # [..., M]
+    targets = torch.stack(target_cols, dim=-1)                   # [..., M]
 
-    if mean_fn is None:
-        a_raw = gp_posterior(feat, anchors, targets, ls)
-    else:
-        # conditional mean with the learned prior: ONE batched mean_fn call over
-        # the query + the M anchor counterfactuals (context held fixed)
-        M = anchors.shape[0]
-        anc = anchors.expand(*feat.shape[:-1], M, anchors.shape[-1])
-        phi_all = torch.cat([feat.unsqueeze(-2), anc], dim=-2)     # [..., M+1, 4]
-        # the learned mean f is 3-D (g, τ, γ) — it does NOT see promotion; evaluate it on
-        # the 3-D slice so promotion lives ONLY in the prescribed anchor targets.
-        f_all = mean_fn(phi_all[..., :3])                          # [..., M+1]
-        a_raw = gp_posterior(feat, anchors, targets, ls,
-                             mean_q=f_all[..., 0], mean_X=f_all[..., 1:])
+    a_raw = gp_posterior(feat, anchors, targets, ls)
 
-    # differentiable safety floor: never weaker than the saturated brake when g<1
     if brake_floor:
         a_raw = brake_safety_floor(a_raw, a_brake, g)
 
@@ -719,12 +573,164 @@ def controller_acceleration(
         a_damped = a_prev + kappa * (a_raw - a_prev)
         a_out = torch.where(a_raw < a_prev, a_raw, a_damped) if brake_exempt else a_damped
 
-    # feat = [..., 3] live query features (g, τ_c, r) — exposed so a downstream
-    # hinge-gradient polish can build the controller's own ARD Gram K^φ over them.
-    if return_roles and return_feat:
-        return a_out, is_pred, feat
-    if return_roles:
-        return a_out, is_pred
     if return_feat:
         return a_out, feat
     return a_out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Signal phase definitions
+# ─────────────────────────────────────────────────────────────────────────────
+# Movement index = approach*3 + dir
+#   approach: 0=E  1=W  2=N  3=S
+#   dir:      0=r  1=s  2=l
+# E.r=0 E.s=1 E.l=2  W.r=3 W.s=4 W.l=5
+# N.r=6 N.s=7 N.l=8  S.r=9 S.s=10 S.l=11
+
+_AR = frozenset()
+SIGNAL_PHASES = [
+    frozenset({0, 1, 3, 4}),    # Phase 0: EW through + right  (30 s)
+    _AR,                          # all-red                       ( 3 s)
+    frozenset({2, 5}),            # Phase 1: EW protected left    (15 s)
+    _AR,                          # all-red                       ( 3 s)
+    frozenset({6, 7, 9, 10}),   # Phase 2: NS through + right   (30 s)
+    _AR,                          # all-red                       ( 3 s)
+    frozenset({8, 11}),           # Phase 3: NS protected left    (15 s)
+    _AR,                          # all-red                       ( 3 s)
+]
+SIGNAL_PHASE_DURS = [30.0, 3.0, 15.0, 3.0, 30.0, 3.0, 15.0, 3.0]
+SIGNAL_CYCLE = sum(SIGNAL_PHASE_DURS)  # 102 s
+
+_SIGNAL_CUM: list = []
+_c = 0.0
+for _d in SIGNAL_PHASE_DURS:
+    _c += _d
+    _SIGNAL_CUM.append(_c)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Signal-phase kernel controller
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SignalController:
+    """Signal-phase GP kernel controller for a signalised intersection.
+
+    Receives geometry (conf, s_junc) from the harness at construction — swap the
+    geometry object to run on a different net without touching this class.
+
+    State kept across steps:
+        committed  — vehicle ids that entered the box on a green phase; they keep
+                     passer role even after the phase switches (premature-on_box can
+                     place them on an internal lane up to ~4 m before the arc-length
+                     junction entry, so d_junc > 0 alone is not a safe commit test).
+        prev_a     — last applied acceleration per vehicle (Angle-2 damping lag).
+    """
+
+    def __init__(self, conf: torch.Tensor, s_junc: torch.Tensor):
+        """
+        conf    [M, M] bool  — True where movements i and j conflict
+        s_junc  [M]    float — arc-length from route start to box entry per movement
+        """
+        self.conf   = conf
+        self.s_junc = s_junc
+        self.committed: set = set()
+        self.prev_a: dict   = {}
+
+    def reset(self):
+        self.committed.clear()
+        self.prev_a.clear()
+
+    def step(self, vehs: list, mvi: torch.Tensor, vs: torch.Tensor,
+             gap: torch.Tensor, v_lead: torch.Tensor,
+             d_junc: torch.Tensor, on_box: list, t: float):
+        """
+        One simulation step — returns accelerations and diagnostic info.
+
+        Args:
+            vehs    list[str]   vehicle ids, length N
+            mvi     [N] int     movement index per vehicle
+            vs      [N] float   current speed (m/s)
+            gap     [N] float   bumper-to-bumper gap to same-queue leader (m)
+            v_lead  [N] float   leader speed (m/s)
+            d_junc  [N] float   arc-length to junction entry (>0 approaching, <0 past)
+            on_box  list[bool]  True if SUMO placed vehicle on an internal lane
+            t       float       simulation time (s)
+
+        Returns:
+            a     [N]  final acceleration commands (m/s²)
+            info  dict is_yield, role, yield_cap, box_cap  (all [N])
+        """
+        N = len(vehs)
+
+        # ── Signal phase → is_yield ──────────────────────────────────────────
+        _t_cyc = t % SIGNAL_CYCLE
+        _pidx  = next(k for k, cum in enumerate(_SIGNAL_CUM) if _t_cyc < cum)
+        _green = SIGNAL_PHASES[_pidx]
+        is_yield = torch.tensor(
+            [int(mvi[i]) not in _green for i in range(N)], dtype=torch.bool)
+
+        # ── Committed-crosser tracking ───────────────────────────────────────
+        # A vehicle is committed once SUMO places it on an internal lane (on_box)
+        # while its movement is green.  It keeps passer role to clear the box
+        # even if the phase switches before its arc-length d_junc crosses zero.
+        for i, v in enumerate(vehs):
+            if on_box[i] and not bool(is_yield[i]):
+                self.committed.add(v)
+        in_box = torch.tensor(
+            [(vehs[i] in self.committed) or float(d_junc[i]) < 0.0
+             for i in range(N)], dtype=torch.bool)
+        role = ((~is_yield) | in_box).float()  # 1 = passer/committed, 0 = yielder
+
+        # ── GP kernel ────────────────────────────────────────────────────────
+        a_prev_t = torch.tensor([self.prev_a.get(v, 0.0) for v in vehs])
+        a = controller_acceleration(
+            torch.zeros(N), gap + L_VEH, vs, v_lead,
+            role=role, a_prev=a_prev_t, kappa=0.5,
+            brake_exempt=True, brake_floor=True)
+        a = a.detach().clone()
+
+        # ── Box-entry mutual exclusion (box_cap) ─────────────────────────────
+        # An approaching vehicle brakes to a stop before the box if a conflicting
+        # movement physically occupies it.  In-box vehicles are always exempt.
+        box_cap = torch.full((N,), float("inf"))
+        occ_mv  = {int(mvi[i]) for i in range(N) if on_box[i]}
+        if occ_mv:
+            for i in range(N):
+                if on_box[i]:
+                    continue
+                _dj = float(d_junc[i])
+                if _dj <= 0.0:
+                    continue
+                if any(bool(self.conf[occ, int(mvi[i])]) for occ in occ_mv):
+                    box_cap[i] = (2.0 * B_MAX * _dj) ** 0.5
+
+        # ── Yield cap + decel floor ──────────────────────────────────────────
+        # Red-phase vehicles stop STOP_OFFSET m before the box (keeps them clear
+        # of SUMO's premature-on_box zone, ~4 m for right-turn arcs).
+        # Committed crossers and vehicles already past the arc-length entry are exempt.
+        yield_cap = torch.full((N,), float("inf"))
+        for i in range(N):
+            if not bool(is_yield[i]) or vehs[i] in self.committed:
+                continue
+            _dj = float(d_junc[i])
+            if _dj <= 0.0:
+                continue
+            yield_cap[i] = (2.0 * B_MAX * max(_dj - STOP_OFFSET, 0.0)) ** 0.5
+
+        for i in range(N):
+            if not bool(is_yield[i]) or vehs[i] in self.committed:
+                continue
+            _dj = float(d_junc[i])
+            if _dj <= 0.0:
+                continue
+            _v_i = float(vs[i])
+            if _v_i <= 0.01:
+                continue
+            _a_req = max(-B_MAX, -(_v_i ** 2) / (2.0 * max(_dj - STOP_OFFSET, 0.001)))
+            a[i] = min(float(a[i]), _a_req)
+
+        for i, v in enumerate(vehs):
+            self.prev_a[v] = float(a[i])
+
+        return a, dict(is_yield=is_yield, role=role,
+                       yield_cap=yield_cap, box_cap=box_cap)
