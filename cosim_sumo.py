@@ -130,7 +130,7 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
         vph          dict s/l/r → veh/h per approach  (default 200/100/100)
         seed         SUMO random seed
         gui          launch sumo-gui
-        gui_speed    GUI playback speed (>1 = faster than real-time)
+        gui_speed    GUI playback speed (>1 = faster than real-time; 0 = unthrottled)
         t_end        simulation end time in seconds  (default T_END=120)
         controller   'kernel'  our GP signal-phase controller (differentiable)
                      'nn'      PhaseNet adaptive controller (loads checkpoint)
@@ -171,11 +171,13 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
         AX = torch.tensor([m.axis for m in mv])
         SG = torch.tensor([m.sgn  for m in mv])
         CONF = CONF.clone()
+        MERGE = torch.zeros((M, M), dtype=torch.bool)
         for _i in range(M):
             for _j in range(M):
                 if _i != _j and mv[_i].frm != mv[_j].frm and mv[_i].to == mv[_j].to:
-                    CONF[_i, _j] = True   # add merge conflicts (same exit road)
-        ctrl = utils.SignalController(conf=CONF, s_junc=s_junc_g)
+                    CONF[_i, _j]  = True   # add merge conflicts (same exit road)
+                    MERGE[_i, _j] = True   # same exit → funnel/follow, not crossing
+        ctrl = utils.SignalController(conf=CONF, s_junc=s_junc_g, s_cp=_s_cp, merge=MERGE)
 
     # nn-mode: load PhaseNet checkpoint
     nn_net = None
@@ -198,7 +200,8 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
         else:
             import signal_nn as SN
             print(f"  [nn] WARNING: no checkpoint at {_model_path!r} — random weights")
-            nn_net = SN.PhaseNet(hidden=32, n_heads=2, n_layers=1).to(torch.device("cpu"))
+            _arch  = {"n_in": 4, "hidden": 32, "n_heads": 2, "n_layers": 1}
+            nn_net = SN.PhaseNet(**_arch).to(torch.device("cpu"))
         nn_net.eval()
 
     sumo_bin = sumolib.checkBinary("sumo-gui" if gui else "sumo")
@@ -225,11 +228,8 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
     configured, mv_idx, exited = set(), {}, set()
     arrived, collided = [], set()
 
-    # nn-mode cycle state: default timing used during warm-up, NN takes over after WARMUP_T
     if controller == "nn":
-        _nn_c, _nn_e = SN.cycle_boundaries(SN._DEFAULT_T, 0.0)
-        _nn_cycle_end = float(_nn_e[-1].item()) + SN.T_AR
-        _nn_active    = False
+        rh_signal = SN.RollingHorizonSignal(nn_net)
     dep_dir = {d: 0 for d in "slr"}
     arr_dir = {d: 0 for d in "slr"}
     _no_arrival_steps = 0
@@ -261,7 +261,7 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
             traci.simulationStep()
             _n = traci.simulation.getArrivedNumber()
             arrived.append(_n)
-            if gui:
+            if gui and gui_speed > 0:
                 time.sleep(max(0.0, DT / gui_speed - (time.perf_counter() - t_wall)))
             continue
 
@@ -302,27 +302,11 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
 
             t_now = step * DT
 
-            # nn-mode: determine current green from NN-driven cycle
+            # nn-mode rolling-horizon: delegate entirely to RollingHorizonSignal
             if controller == "nn":
-                if not _nn_active and t_now >= SN.WARMUP_T:
-                    _nn_active = True
-                    with torch.no_grad():
-                        feat  = SN.phase_features(s_front, vs, mvi_t, s_junc_g)
-                        T_all = nn_net(feat[:, :_arch["n_in"]])
-                    _nn_c, _nn_e = SN.cycle_boundaries(T_all, t_now)
-                    _nn_cycle_end = float(_nn_e[-1].item()) + SN.T_AR
-                elif _nn_active and t_now >= _nn_cycle_end:
-                    with torch.no_grad():
-                        feat  = SN.phase_features(s_front, vs, mvi_t, s_junc_g)
-                        T_all = nn_net(feat[:, :_arch["n_in"]])
-                    _nn_c, _nn_e = SN.cycle_boundaries(T_all, _nn_cycle_end)
-                    _nn_cycle_end = float(_nn_e[-1].item()) + SN.T_AR
-
-                nn_green_override = frozenset()
-                for _k in range(SN.N_PHASES):
-                    if float(_nn_c[_k]) <= t_now < float(_nn_e[_k]):
-                        nn_green_override = SN._PHASE_GREEN[_k]
-                        break
+                with torch.no_grad():
+                    nn_green_override, _, _ = rh_signal.step(
+                        t_now, s_front, vs, mvi_t, s_junc_g)
             else:
                 nn_green_override = None
 
@@ -331,6 +315,21 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
             is_yield  = info["is_yield"]
             yield_cap = info["yield_cap"]
             box_cap   = info["box_cap"]
+            opp_flags = info["opp"]
+
+            # debug: track opp=1 vehicles inside the junction box
+            for _i, _v in enumerate(vehs):
+                if float(opp_flags[_i]) > 0.5 and on_box[_i]:
+                    print(
+                        f"  [OPP-IN-BOX t={t_now:.1f}s] {_v}"
+                        f"  mv={mv[int(mvi_t[_i])].frm}.{DIRNAME[int(mvi_t[_i])]}"
+                        f"  d={float(d_junc[_i]):.1f}"
+                        f"  v={float(vs[_i]):.2f}"
+                        f"  a={float(a[_i]):.2f}"
+                        f"  yield={int(bool(is_yield[_i]))}"
+                        f"  ycap={float(yield_cap[_i]):.2f}"
+                        f"  bcap={float(box_cap[_i]):.2f}"
+                    )
 
             for i, v in enumerate(vehs):
                 if v in exited:
@@ -362,15 +361,17 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
                 if i is None:
                     rec_list.append({"id": cv})
                 else:
+                    _opp_i = int(opp_flags[i] > 0.5) if controller in ("kernel", "nn") else 0
                     rec_list.append({
-                        "id": cv,
-                        "mv": f"{mv[int(mvi_t[i])].frm}.{DIRNAME[int(mvi_t[i])]}",
-                        "v":  round(float(vs[i]), 2),
-                        "d":  round(float(d_junc[i]) if controller in ("kernel", "nn") else 0.0, 1),
+                        "id":  cv,
+                        "mv":  f"{mv[int(mvi_t[i])].frm}.{DIRNAME[int(mvi_t[i])]}",
+                        "v":   round(float(vs[i]), 2),
+                        "d":   round(float(d_junc[i]) if controller in ("kernel", "nn") else 0.0, 1),
                         "box": int(on_box[i]),
+                        "opp": _opp_i,
                     })
             parts = [f"{r['id']}[{r.get('mv','?')} d={r.get('d','?')} "
-                     f"v={r.get('v','?')} box={r.get('box','?')}]"
+                     f"v={r.get('v','?')} box={r.get('box','?')} opp={r.get('opp','?')}]"
                      for r in rec_list]
             print(f"  [COLLISION @ t={step*DT:.1f}s]  " + "   ".join(parts))
             _collision_log.append({"t": round(step * DT, 1), "vehicles": rec_list})
@@ -380,7 +381,7 @@ def run(vph=None, seed=0, gui=False, gui_speed=3.0, t_end=None,
             print(f"  [gridlock @ t={step*DT:.1f}s — no arrivals for {gridlock_s:.0f}s]")
             break
 
-        if gui:
+        if gui and gui_speed > 0:
             time.sleep(max(0.0, DT / gui_speed - (time.perf_counter() - t_wall)))
 
     i40       = int(40 / DT)

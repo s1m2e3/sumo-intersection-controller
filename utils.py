@@ -618,22 +618,67 @@ for _d in SIGNAL_PHASE_DURS:
 _GREEN_PHASE_SETS = [p for p in SIGNAL_PHASES if p]   # 4 frozensets
 
 # Opportunistic-movement physical constants
-_OPP_ETA_A_MAX  = 2.0    # m/s²  free-flow accel used for leader ETA estimate
+_OPP_ETA_A_MAX  = A_MAX  # m/s²  free-flow accel used for leader ETA estimate (matches controller's free-flow anchor)
 _OPP_ETA_RANGE  = 100.0  # m     look-ahead distance for approaching vehicles
 _OPP_D_CONFLICT = 10.0   # m     past stop bar to approximate conflict point
-_OPP_GAP_MIN    = 3.0    # s     minimum certified gap each side for passage
+_OPP_GAP_MIN    = 3.0    # s     min gap: following active vehicle (after-side)
+_OPP_BEFORE_MIN = 1.5    # s     min gap: preceding active vehicle (before-side)
+_OPP_JUNC_LEN   = 20.0   # m     estimated junction crossing length for merge-conflict clearance
+                          #       ≈ (L_VEH+D_CONFLICT)/V0 + margin; smaller than
+                          #       after-side because the preceding vehicle has already
+                          #       cleared the conflict zone before the candidate enters
+_OPP_LATCH_DUR  = 1.0    # s     (legacy) losing phases locked after a winner is chosen
+_OPP_RETEST_DT  = 0.5    # s     (legacy) re-test fires this long after latest award
+_OPP_OCC_VFLOOR = 0.5    # m/s   speed floor when turning a declared passer's footprint
+                         #       into an OCCUPANCY duration (CONFLICT_LEN / v).  A slow /
+                         #       stopped passer in the box then blocks for a long interval
+                         #       rather than vanishing as an instantaneous point-crossing.
+_MERGE_FOLLOW_RANGE = 8.0  # m   a same-exit vehicle within this distance of (or past) the
+                         #       merge point, and ahead of the ego in the funnel, becomes a
+                         #       virtual car-following LEADER.  Same-exit movements do not
+                         #       cross-and-clear — they merge into one lane — so the safe
+                         #       condition is a follower gap, not a transversal time-gap.
 
 
 def compute_opp_flags(green_mvs, mvi: torch.Tensor, vs: torch.Tensor,
-                      d_junc: torch.Tensor) -> torch.Tensor:
-    """Opportunistic flag [N] — 1.0 for the leader of each non-active phase
-    whose free-flow ETA to the conflict point falls in a ≥_OPP_GAP_MIN s gap
-    in the active-phase traffic stream.
+                      d_junc: torch.Tensor,
+                      t: float = 0.0,
+                      opp_timers: dict = None,
+                      conf: torch.Tensor = None,
+                      s_cp: torch.Tensor = None,
+                      s_junc: torch.Tensor = None,
+                      passer_mask: list = None) -> torch.Tensor:
+    """Opportunistic flag [N] — 1.0 for each non-active-phase leader that can
+    thread a safe gap through *everything already entitled to the box*: the
+    active green stream AND every vehicle already declared a passer (committed
+    crossers from earlier steps, plus winners awarded earlier in THIS call).
 
-    green_mvs  frozenset   currently active green movement set
-    mvi        [N] int     movement index per vehicle
-    vs         [N] float   speed (m/s)
-    d_junc     [N] float   distance to junction (>0 approaching, <0 past)
+    Unified gap model.  The award is decided by a single greedy loop: take the
+    earliest-ETA candidate that fits the current occupied stream, award it, fold
+    it into the stream as a passer, then re-test the rest.  There is no separate
+    inter-candidate pass and no latch — a winner that has entered the box is
+    re-derived every step as an *occupant*, never as a re-selectable candidate,
+    so the old "winner-flip" race (two opp movers from conflicting approaches
+    both awarded within ~1 s) can no longer place two crossers in the box.
+
+    Two rival models share one geometric ETA:
+      • active-phase vehicle — point-crossing with asymmetric margins
+        (_OPP_BEFORE_MIN / _OPP_GAP_MIN), as before.
+      • declared passer — OCCUPANCY interval [η, η + CONFLICT_LEN/v]: a slow or
+        stopped crosser holds the conflict point until its body clears, so a
+        candidate must fit entirely before or after that interval.
+
+    green_mvs   frozenset        currently active green movement set
+    mvi         [N] int          movement index per vehicle
+    vs          [N] float        speed (m/s)
+    d_junc      [N] float        distance to junction (>0 approaching, <0 past)
+    t           float            current simulation time (s)   (unused; kept for API)
+    opp_timers  dict|None        legacy latch state (unused; kept for API)
+    conf        [M,M] bool|None  True where movements i and j conflict
+    s_cp        [M,M] float|None arc-length along route i to conflict with j
+    s_junc      [M]   float|None arc-length from route start to box entry
+    passer_mask [N] bool|None    True where vehicle is already a committed/in-box
+                                 crosser (declared passer).  None → all False.
 
     Returns a plain float tensor — no autograd involvement.
     """
@@ -643,81 +688,121 @@ def compute_opp_flags(green_mvs, mvi: torch.Tensor, vs: torch.Tensor,
         return opp   # all-red
 
     mvi_list  = mvi.tolist()
-    in_active = torch.tensor([int(m) in green_mvs for m in mvi_list], dtype=torch.bool)
+    in_active = [int(m) in green_mvs for m in mvi_list]
+    if passer_mask is None:
+        passer_mask = [False] * N
 
-    # Free-flow kinematic ETAs of active-phase vehicles to the conflict point.
-    # Use the same accelerating estimator as pass-1 (not constant-speed) so that
-    # a just-spawned active vehicle at v≈0 gets its realistic minimum arrival time
-    # (~21 s from d=200 m) rather than the constant-speed 2100 s that would let
-    # an opp candidate slip through a false gap.
-    if in_active.any():
-        eta_active = []
-        for _dc, _vc in zip(
-                (d_junc[in_active] + _OPP_D_CONFLICT).clamp(min=0.0).tolist(),
-                vs[in_active].clamp(min=0.0).tolist()):
-            _a  = _OPP_ETA_A_MAX
-            _da = max(0.0, (V0 ** 2 - _vc ** 2) / (2.0 * _a))
-            if _dc <= _da:
-                eta_active.append(
-                    (-_vc + math.sqrt(max(_vc ** 2 + 2.0 * _a * _dc, 0.0))) / _a)
-            else:
-                eta_active.append((V0 - _vc) / _a + (_dc - _da) / V0)
-    else:
-        eta_active = []
+    # ── Per-pair geometry / ETA helpers ──────────────────────────────────────
+    def _dc_signed(mv_from: int, d_from: float, mv_to: int) -> float:
+        """SIGNED distance (m) from mv_from's current position to its conflict
+        point with mv_to (negative once past it)."""
+        if s_cp is not None and s_junc is not None:
+            _cp = float(s_cp[mv_from, mv_to])
+            if math.isnan(_cp):
+                # merge conflict (same exit, no crossing): use junction-exit distance
+                return d_from + _OPP_JUNC_LEN
+            return _cp - float(s_junc[mv_from]) + d_from
+        return d_from + _OPP_D_CONFLICT
 
-    # Pass 1: collect candidates — (veh_idx, eta_at_conflict, queue_size)
+    def _kin(dc: float, v: float) -> float:
+        _a  = _OPP_ETA_A_MAX
+        _da = max(0.0, (V0 ** 2 - v ** 2) / (2.0 * _a))
+        if dc <= _da:
+            return (-v + math.sqrt(max(v ** 2 + 2.0 * _a * dc, 0.0))) / _a
+        return (V0 - v) / _a + (dc - _da) / V0
+
+    def _eta(mv_from: int, d_from: float, v_from: float, mv_to: int) -> float:
+        """Kinematic ETA (s) to the mv_from→mv_to conflict point (clamped ≥0)."""
+        return _kin(max(_dc_signed(mv_from, d_from, mv_to), 0.0), v_from)
+
+    def _occ(mv_from: int, d_from: float, v_from: float, mv_to: int) -> float:
+        """Body-clear time (s) at the conflict point, using the speed the vehicle
+        will ACTUALLY have when it gets there (free-flow accel to V0) rather than
+        its current speed — a passer accelerating into the box clears the point
+        far quicker than CONFLICT_LEN / v_now would suggest."""
+        dc   = max(_dc_signed(mv_from, d_from, mv_to), 0.0)
+        v_cp = min(V0, math.sqrt(max(v_from ** 2 + 2.0 * _OPP_ETA_A_MAX * dc, 0.0)))
+        return CONFLICT_LEN / max(v_cp, _OPP_OCC_VFLOOR)
+
+    # ── Occupied stream R: list of (d_junc, speed, mv_index, is_passer) ───────
+    # Active-phase vehicles (point-crossing rivals) and declared passers
+    # (occupancy-interval rivals: committed/in-box non-active crossers).
+    rivals = []
+    for i in range(N):
+        if in_active[i]:
+            rivals.append((float(d_junc[i]), max(float(vs[i]), 0.1), int(mvi[i]), False))
+        elif passer_mask[i] or float(d_junc[i]) <= 0.0:
+            rivals.append((float(d_junc[i]), max(float(vs[i]), 0.1), int(mvi[i]), True))
+
+    def _blocks(rival, c_mv: int, c_d: float, c_v: float) -> bool:
+        """True if `rival` denies the candidate (c_mv,c_d,c_v) its gap."""
+        r_d, r_v, r_mv, r_passer = rival
+        if r_mv == c_mv:
+            return False
+        if conf is not None and not bool(conf[r_mv, c_mv]):
+            return False
+        if r_passer:
+            # A passer that has fully crossed the candidate's path no longer blocks.
+            if _dc_signed(r_mv, r_d, c_mv) < -CONFLICT_LEN:
+                return False
+            eta_r = _eta(r_mv, r_d, r_v, c_mv)
+            eta_c = _eta(c_mv, c_d, c_v, r_mv)
+            occ_r = _occ(r_mv, r_d, r_v, c_mv)   # rival body-clear time (speed at CP)
+            occ_c = _occ(c_mv, c_d, c_v, r_mv)   # candidate body-clear time (speed at CP)
+            cand_after  = (eta_c - (eta_r + occ_r)) >= _OPP_BEFORE_MIN  # enter after it clears
+            cand_before = (eta_r - (eta_c + occ_c)) >= _OPP_GAP_MIN     # clear before it enters
+            return not (cand_after or cand_before)
+        # active-phase rival: point-crossing with asymmetric margins
+        gap = _eta(c_mv, c_d, c_v, r_mv) - _eta(r_mv, r_d, r_v, c_mv)
+        if gap >= 0.0:
+            return gap < _OPP_BEFORE_MIN
+        return -gap < _OPP_GAP_MIN
+
+    def _feasible(c_mv, c_d, c_v) -> bool:
+        return not any(_blocks(r, c_mv, c_d, c_v) for r in rivals)
+
+    # ── Candidates: nearest approaching, non-committed leader per idle phase ──
     candidates = []
     for phase_set in _GREEN_PHASE_SETS:
         if phase_set & green_mvs:
             continue
-        in_phase = torch.tensor([int(m) in phase_set for m in mvi_list], dtype=torch.bool)
-        appr     = in_phase & (d_junc > 0.0) & (d_junc < _OPP_ETA_RANGE)
-        if not appr.any():
+        best_i, best_d = -1, float('inf')
+        for i in range(N):
+            if passer_mask[i] or mvi_list[i] not in phase_set:
+                continue
+            dj = float(d_junc[i])
+            if not (0.0 < dj < _OPP_ETA_RANGE):
+                continue
+            if dj < best_d:
+                best_i, best_d = i, dj
+        if best_i < 0:
             continue
+        c_mv = mvi_list[best_i]
+        c_d  = float(d_junc[best_i])
+        c_v  = max(float(vs[best_i]), 0.1)
+        # representative ETA (to nearest conflicting occupant) for greedy ordering
+        min_eta = float('inf')
+        for r in rivals:
+            if conf is not None and not bool(conf[r[2], c_mv]):
+                continue
+            min_eta = min(min_eta, _eta(c_mv, c_d, c_v, r[2]))
+        eta_repr = min_eta if min_eta < float('inf') else _kin(c_d + _OPP_D_CONFLICT, c_v)
+        candidates.append((best_i, c_mv, c_d, c_v, eta_repr))
 
-        appr_idx = appr.nonzero().flatten()
-        d_appr   = d_junc[appr]
-        v_appr   = vs[appr]
-        loc      = int(d_appr.argmin())
-        d_lead   = float(d_appr[loc])
-        v_lead_  = float(v_appr[loc])
-        queue    = int(appr.sum())          # total approaching in this phase
-
-        d_conf  = d_lead + _OPP_D_CONFLICT
-        a       = _OPP_ETA_A_MAX
-        d_accel = max(0.0, (V0 ** 2 - v_lead_ ** 2) / (2.0 * a))
-        if d_conf <= d_accel:
-            t_eta = (-v_lead_ + math.sqrt(max(v_lead_ ** 2 + 2.0 * a * d_conf, 0.0))) / a
-        else:
-            t_eta = (V0 - v_lead_) / a + (d_conf - d_accel) / V0
-
-        candidates.append((int(appr_idx[loc]), t_eta, queue))
-
-    if not candidates:
-        return opp
-
-    # Pass 2: filter by active-phase gap (only the active stream as rivals here)
-    feasible = []
-    for veh_idx, eta_i, queue_i in candidates:
-        before = [eta_i - e for e in eta_active if e < eta_i]
-        after  = [e - eta_i for e in eta_active if e > eta_i]
-        if (not before or min(before) >= _OPP_GAP_MIN) and \
-           (not after  or min(after)  >= _OPP_GAP_MIN):
-            feasible.append((veh_idx, eta_i, queue_i))
-
-    # Pass 3: resolve inter-candidate conflicts by queue priority (greedy).
-    # Two feasible candidates conflict if their ETAs are within _OPP_GAP_MIN.
-    # Greedily pick the highest-queue candidate, grant it opp, remove it and
-    # every candidate that conflicts with it, repeat — at most one vehicle per
-    # conflicting cluster gets through.
-    n        = len(feasible)
-    conflict = [[abs(feasible[i][1] - feasible[j][1]) < _OPP_GAP_MIN
-                 for j in range(n)] for i in range(n)]
-    remaining = set(range(n))
-    while remaining:
-        best = max(remaining, key=lambda i: feasible[i][2])
-        opp[feasible[best][0]] = 1.0
-        remaining -= {best} | {j for j in remaining if conflict[best][j]}
+    # ── Merged greedy: award earliest-ETA candidate that fits, fold into R ────
+    candidates.sort(key=lambda c: c[4])
+    pending = list(candidates)
+    while pending:
+        awarded = None
+        for k, (idx, c_mv, c_d, c_v, _e) in enumerate(pending):
+            if _feasible(c_mv, c_d, c_v):
+                awarded = k
+                opp[idx] = 1.0
+                rivals.append((c_d, c_v, c_mv, True))   # winner now occupies the box
+                break
+        if awarded is None:
+            break
+        pending.pop(awarded)
 
     return opp
 
@@ -740,19 +825,28 @@ class SignalController:
         prev_a     — last applied acceleration per vehicle (Angle-2 damping lag).
     """
 
-    def __init__(self, conf: torch.Tensor, s_junc: torch.Tensor):
+    def __init__(self, conf: torch.Tensor, s_junc: torch.Tensor,
+                 s_cp: torch.Tensor = None, merge: torch.Tensor = None):
         """
         conf    [M, M] bool  — True where movements i and j conflict
         s_junc  [M]    float — arc-length from route start to box entry per movement
+        s_cp    [M, M] float — arc-length along route i to conflict point with j
+        merge   [M, M] bool  — True where movements i and j share an exit lane
+                               (same `to`): they funnel together, so the safe
+                               relation is car-following, not a transversal gap.
         """
         self.conf   = conf
         self.s_junc = s_junc
-        self.committed: set = set()
-        self.prev_a: dict   = {}
+        self.s_cp   = s_cp
+        self.merge  = merge
+        self.committed: set  = set()
+        self.prev_a: dict    = {}
+        self.opp_timers: dict = {}   # latch state for opportunistic selector
 
     def reset(self):
         self.committed.clear()
         self.prev_a.clear()
+        self.opp_timers.clear()
 
     def step(self, vehs: list, mvi: torch.Tensor, vs: torch.Tensor,
              gap: torch.Tensor, v_lead: torch.Tensor,
@@ -788,7 +882,19 @@ class SignalController:
             [int(mvi[i]) not in _green for i in range(N)], dtype=torch.bool)
 
         # ── Opportunistic flags (needed before committed tracking) ───────────
-        opp = compute_opp_flags(_green, mvi, vs, d_junc)
+        # Declared passers = vehicles already committed to crossing the box.
+        # They are folded into the opp selector's occupied stream so a new
+        # opportunistic mover must fit a gap AROUND them, not ignore them.  Raw
+        # on_box is deliberately NOT used: SUMO places braking non-active yielders
+        # on an internal lane ~4 m early, and those are not box occupants.
+        # Genuine in-box crossers are still caught by the d_junc≤0 clause inside
+        # compute_opp_flags, and this-step winners by the greedy loop.
+        passer_mask = [vehs[i] in self.committed for i in range(N)]
+        opp = compute_opp_flags(_green, mvi, vs, d_junc,
+                                t=t, opp_timers=self.opp_timers,
+                                conf=self.conf,
+                                s_cp=self.s_cp, s_junc=self.s_junc,
+                                passer_mask=passer_mask)
 
         # ── Committed-crosser tracking ───────────────────────────────────────
         # A vehicle is committed once SUMO places it on an internal lane (on_box)
@@ -801,6 +907,48 @@ class SignalController:
             [(vehs[i] in self.committed) or float(d_junc[i]) < 0.0
              for i in range(N)], dtype=torch.bool)
         role = ((~is_yield) | in_box).float()  # 1 = passer/committed, 0 = yielder
+
+        # ── Merge follower coupling (opportunistic / non-green movers only) ───
+        # Two movements sharing an exit lane do NOT cross-and-clear — they funnel
+        # into one lane.  A same-exit vehicle at/just past the merge point and
+        # AHEAD of the ego in the funnel is a virtual car-following LEADER, so the
+        # ego's gap state becomes min(same-queue gap, merge gap).  The kernel then
+        # brakes a closing opp/free mover (g<1 → brake anchor for ALL roles)
+        # instead of accelerating into the back of a slow merger.
+        #
+        # This applies ONLY to non-active-phase movers (is_yield → opportunistic
+        # crossers and committed-opp crossers).  A vehicle that actually HAS the
+        # green keeps its right-of-way: it follows its same-queue leader only and
+        # never brakes for a merger — the inserting opp vehicle owns the gap.
+        if self.merge is not None and self.s_cp is not None and self.s_junc is not None:
+            gap     = gap.clone()
+            v_lead  = v_lead.clone()
+            _dl     = d_junc.tolist()
+            _mvl    = mvi.tolist()
+            for i in range(N):
+                if not bool(is_yield[i]):
+                    continue                  # green ego: same-queue leader only
+                m_i = int(_mvl[i])
+                for j in range(N):
+                    if i == j:
+                        continue
+                    m_j = int(_mvl[j])
+                    if not bool(self.merge[m_i, m_j]):
+                        continue
+                    cp_i = float(self.s_cp[m_i, m_j])
+                    cp_j = float(self.s_cp[m_j, m_i])
+                    if math.isnan(cp_i) or math.isnan(cp_j):
+                        continue
+                    # remaining distance for each vehicle to the shared merge point
+                    delta_i = (cp_i - float(self.s_junc[m_i])) + float(_dl[i])
+                    delta_j = (cp_j - float(self.s_junc[m_j])) + float(_dl[j])
+                    # j leads only once it is at/just past the merge and ahead of i
+                    if delta_j > _MERGE_FOLLOW_RANGE or delta_j >= delta_i:
+                        continue
+                    mg = (delta_i - delta_j) - L_VEH      # along-funnel bumper gap
+                    if mg < float(gap[i]):
+                        gap[i]    = max(mg, 0.0)
+                        v_lead[i] = float(vs[j])
 
         # ── GP kernel ────────────────────────────────────────────────────────
         a_prev_t = torch.tensor([self.prev_a.get(v, 0.0) for v in vehs])
@@ -854,4 +1002,4 @@ class SignalController:
             self.prev_a[v] = float(a[i])
 
         return a, dict(is_yield=is_yield, role=role,
-                       yield_cap=yield_cap, box_cap=box_cap)
+                       yield_cap=yield_cap, box_cap=box_cap, opp=opp)

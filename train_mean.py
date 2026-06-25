@@ -112,19 +112,19 @@ AX_MV = torch.tensor([C.ORIGIN[m][0] for m in C._MOVES])
 SG_MV = torch.tensor([C.ORIGIN[m][1] for m in C._MOVES])
 
 # ── initial-condition pool: realized SUMO departures, collected once ────────────
-IC_FLOWS = (500, 600, 700)      # train across the saturation range (was 500 only) so f
-                                # generalizes to the high-demand densities it under-served
+IC_FLOWS = (500, 600, 700)      # default: train across the saturation range
 IC_SEEDS = tuple(range(16))     # 16 seeds → 16 scenarios in the pool
-IC_CACHE = f"_ic_pool_{'_'.join(map(str, IC_FLOWS))}.pt"   # flow-tagged ⇒ no stale reuse
+# IC_CACHE is computed per-call from flows (no global constant — avoids stale reuse)
 
 
 def collect_sumo_initial_conditions(flows=IC_FLOWS, seeds=IC_SEEDS):
     """Run headless SUMO per (flow, seed) and record each vehicle's ACTUAL
     departure (t, move_idx) — the realized insertion schedule, including SUMO's
-    entry queueing.  Cached to IC_CACHE; delete the file to re-collect."""
-    if os.path.exists(IC_CACHE):
-        pool = torch.load(IC_CACHE, weights_only=True)
-        print(f"loaded {len(pool)} cached SUMO initial conditions from {IC_CACHE}")
+    entry queueing.  Cached per unique flow set; delete the file to re-collect."""
+    ic_cache = f"_ic_pool_{'_'.join(map(str, sorted(flows)))}.pt"
+    if os.path.exists(ic_cache):
+        pool = torch.load(ic_cache, weights_only=True)
+        print(f"loaded {len(pool)} cached SUMO initial conditions from {ic_cache}")
         return pool
     import traci, sumolib
     mv_id = {m: i for i, m in enumerate(C._MOVES)}
@@ -148,8 +148,8 @@ def collect_sumo_initial_conditions(flows=IC_FLOWS, seeds=IC_SEEDS):
             traci.close()
             pool.append(dict(flow=flow, seed=seed, events=events))
             print(f"  flow={flow} seed={seed:2d}: {len(events)} departures")
-    torch.save(pool, IC_CACHE)
-    print(f"cached {len(pool)} scenarios → {IC_CACHE}")
+    torch.save(pool, ic_cache)
+    print(f"cached {len(pool)} scenarios → {ic_cache}")
     return pool
 
 
@@ -433,15 +433,32 @@ def rollout_episode(model, events, geo, s_cp, path_len, s_junc, jgeo, train=True
 
 
 def main():
-    args   = [a for a in sys.argv[1:] if a != "fresh"]
-    fresh  = "fresh" in sys.argv[1:]
-    epochs = int(args[0]) if len(args) > 0 else 30
-    batch  = int(args[1]) if len(args) > 1 else 8
-    lr     = float(args[2]) if len(args) > 2 else 3e-3
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Train MeanTransformer prior for the GP controller")
+    ap.add_argument("--epochs", "-e", type=int, default=30,
+                    help="number of training epochs (default: 30)")
+    ap.add_argument("--batch", "-b", type=int, default=8,
+                    help="scenarios per epoch batch (default: 8)")
+    ap.add_argument("--lr", type=float, default=3e-3,
+                    help="Adam learning rate (default: 3e-3)")
+    ap.add_argument("--flow", type=int, nargs="+", default=list(IC_FLOWS),
+                    metavar="VPH",
+                    help="vph per movement to train on — one or more values "
+                         "(default: 500 600 700); each unique set gets its "
+                         "own IC cache, so switching flows never reuses stale data")
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore existing checkpoint and start from zero-init")
+    ns = ap.parse_args()
+    fresh  = ns.fresh
+    epochs = ns.epochs
+    batch  = ns.batch
+    lr     = ns.lr
+    flows  = tuple(sorted(ns.flow))
     torch.manual_seed(0)
     random.seed(0)
 
-    pool = collect_sumo_initial_conditions()
+    pool = collect_sumo_initial_conditions(flows=flows)
     geo, s_cp, path_len, s_junc = S.build_geometry()
     jgeo = junction_geometry(geo)
     model = mean_net.make_mean_model()
@@ -478,7 +495,7 @@ def main():
 
     n_windows = int(T_END / WINDOW_S)
     print(f"\ntraining: {epochs} epochs × batch {batch} (pool {len(pool)} SUMO scenarios), "
-          f"lr={lr}, window={WINDOW_S:.0f}s, λ_s={LAM_S}, λ_c={LAM_C}")
+          f"flows={list(flows)} vph, lr={lr}, window={WINDOW_S:.0f}s, λ_s={LAM_S}, λ_c={LAM_C}")
     print(f"one AVERAGED optimizer step per {WINDOW_S:.0f}s window, batched over the "
           f"episodes — up to {n_windows} updates/epoch (warm-up windows skipped)\n")
 

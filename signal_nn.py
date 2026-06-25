@@ -48,13 +48,19 @@ BETA     = 2.0    # sigmoid sharpness
 WARMUP_T = 10.0   # seconds of fixed timing before NN takes over
 
 # ETA-based feasibility projection
-_ETA_A_MAX = 2.0    # free-flow acceleration used for ETA estimate (m/s²)
-_ETA_RANGE = 100.0  # look-ahead distance for approaching vehicles (m)
-_ETA_STEP  = 2.0    # additive correction step size per FGD projection (s)
+_ETA_A_MAX    = 2.0  # free-flow acceleration used for ETA estimate (m/s²)
+_ETA_RANGE    = 100.0 # look-ahead distance for approaching vehicles (m)
+_ETA_STEP     = 2.0  # additive correction step size per FGD projection (s)
+_ETA_D_QUEUE  = 30.0 # committed-queue threshold: vehicle within this distance triggers floor
+_ETA_N_MIN    = 5    # floor targets clearance of this many vehicles per phase
+_ETA_SAT_HEAD = 1.5  # approximate inter-vehicle headway during queue discharge (s)
 
 # Opportunistic movement
 _OPP_D_CONFLICT = 10.0  # m past stop bar to approximate conflict point
-_OPP_GAP_MIN    = 3.0   # s minimum certified gap on each side for opportunistic passage
+_OPP_GAP_MIN    = 3.0   # s min gap: following active vehicle (after-side)
+_OPP_BEFORE_MIN = 1.5   # s min gap: preceding active vehicle (before-side, asymmetric)
+_OPP_LATCH_DUR  = 1.0   # s losing phases locked after a winner is chosen
+_OPP_RETEST_DT  = 0.5   # s re-test fires this long after latest award
 
 # Fixed default durations used during warm-up
 _DEFAULT_T = torch.tensor([30.0, 15.0, 30.0, 15.0])
@@ -195,42 +201,221 @@ def phase_features(s_act: torch.Tensor, v_act: torch.Tensor,
 
 # ── ETA feasibility projection ────────────────────────────────────────────────
 
+def _free_flow_eta(d: float, v: float) -> float:
+    """Kinematic ETA: vehicle at distance d, speed v, accelerates to V0 at _ETA_A_MAX."""
+    v0 = utils.V0
+    a  = _ETA_A_MAX
+    d_accel = max(0.0, (v0 ** 2 - v ** 2) / (2.0 * a))
+    if d <= d_accel:
+        return (-v + math.sqrt(max(v ** 2 + 2.0 * a * d, 0.0))) / a
+    return (v0 - v) / a + (d - d_accel) / v0
+
+
+def _sorted_etas_k(d_m: torch.Tensor, v_m: torch.Tensor) -> list:
+    """Leader-propagated ETAs for one phase, sorted ascending by distance (nearest first).
+
+    For each vehicle: ETA = max(free_flow_ETA_self, ETA_leader + _ETA_SAT_HEAD).
+    The nearest vehicle has no leader and uses its free-flow ETA directly.
+    """
+    order = d_m.argsort()   # ascending: nearest → furthest
+    etas = []
+    for idx in order:
+        t_ff = max(_free_flow_eta(float(d_m[idx]), float(v_m[idx])), 0.0)
+        if etas:
+            t_ff = max(t_ff, etas[-1] + _ETA_SAT_HEAD)
+        etas.append(t_ff)
+    return etas
+
+
 def phase_eta(s_act: torch.Tensor, v_act: torch.Tensor,
               mv_act: torch.Tensor, s_junc: torch.Tensor) -> list:
-    """Free-flow ETA of the furthest approaching vehicle within _ETA_RANGE m, per phase.
+    """Leader-propagated ETA of the last approaching vehicle per phase (ceiling).
 
-    Uses constant-acceleration kinematic: vehicle accelerates from current speed
-    toward V0 at _ETA_A_MAX, then cruises.  Returns T_MAX when no vehicles
-    are approaching a phase (no constraint).
+    Vehicles are sorted by distance ascending; each vehicle's ETA is bounded
+    below by its leader's ETA plus one saturation headway.  The ceiling is the
+    propagated ETA of the furthest vehicle — the last one that needs to arrive.
 
-    Returns a plain Python list of N_PHASES floats — no autograd involvement.
+    Returns T_MAX when no vehicle is within _ETA_RANGE m (no constraint).
+    Plain Python list of N_PHASES floats — no autograd involvement.
     """
     etas = []
     mv_list = mv_act.tolist()
-    d_all   = s_junc[mv_act] - s_act   # [Na]
+    d_all   = s_junc[mv_act] - s_act
     for k in range(N_PHASES):
-        green_k = _PHASE_GREEN[k]
+        green_k  = _PHASE_GREEN[k]
         in_phase = torch.tensor([int(m) in green_k for m in mv_list], dtype=torch.bool)
         mask = in_phase & (d_all > 0.0) & (d_all < _ETA_RANGE)
         if not mask.any():
             etas.append(T_MAX)
             continue
-        d_m   = d_all[mask]
-        v_m   = v_act[mask]
-        idx   = int(d_m.argmax())        # furthest vehicle = last to arrive
-        d_last = float(d_m[idx])
-        v_last = float(v_m[idx])
-        v0    = utils.V0
-        a     = _ETA_A_MAX
-        d_accel = max(0.0, (v0 ** 2 - v_last ** 2) / (2.0 * a))
-        if d_last <= d_accel:
-            # Junction reached before hitting V0
-            t_eta = (-v_last + math.sqrt(max(v_last ** 2 + 2.0 * a * d_last, 0.0))) / a
-        else:
-            t_accel = (v0 - v_last) / a
-            t_eta   = t_accel + (d_last - d_accel) / v0
-        etas.append(max(t_eta, 0.0))
+        propagated = _sorted_etas_k(d_all[mask], v_act[mask])
+        etas.append(propagated[-1])   # furthest vehicle, propagated
     return etas
+
+
+def phase_eta_floor(s_act: torch.Tensor, v_act: torch.Tensor,
+                    mv_act: torch.Tensor, s_junc: torch.Tensor) -> list:
+    """Leader-propagated ETA of the _ETA_N_MIN-th nearest vehicle per phase (floor).
+
+    Returns 0.0 when no committed queue exists (no vehicle within _ETA_D_QUEUE m).
+    If fewer than _ETA_N_MIN vehicles are within _ETA_RANGE, uses the furthest
+    available.  The leader-propagation ensures queue discharge time is respected.
+
+    Plain Python list of N_PHASES floats — no autograd involvement.
+    """
+    floors = []
+    mv_list = mv_act.tolist()
+    d_all   = s_junc[mv_act] - s_act
+    for k in range(N_PHASES):
+        green_k  = _PHASE_GREEN[k]
+        in_phase = torch.tensor([int(m) in green_k for m in mv_list], dtype=torch.bool)
+        mask = in_phase & (d_all > 0.0) & (d_all < _ETA_RANGE)
+        if not mask.any():
+            floors.append(0.0)
+            continue
+        d_m = d_all[mask]
+        if not (d_m < _ETA_D_QUEUE).any():
+            floors.append(0.0)
+            continue
+        propagated = _sorted_etas_k(d_m, v_act[mask])
+        sel = min(_ETA_N_MIN - 1, len(propagated) - 1)
+        floors.append(propagated[sel])
+    return floors
+
+
+def nn_cycle(net, s_act, v_act, mv_act, s_junc, t0):
+    """Canonical NN inference path: features → forward → FGD projection → boundaries.
+
+    Single source of truth for both training (caller holds gradient context) and
+    cosim_sumo (caller wraps in torch.no_grad).
+
+    Returns (T_all, c_starts, c_ends, cycle_end_t).
+    """
+    n_in = net.embed[0].in_features if hasattr(net, "embed") else 4
+    if len(mv_act) > 0:
+        feat        = phase_features(s_act, v_act, mv_act, s_junc)
+        etas_ceil   = phase_eta(s_act, v_act, mv_act, s_junc)
+        etas_floor  = phase_eta_floor(s_act, v_act, mv_act, s_junc)
+    else:
+        feat        = torch.zeros(N_PHASES, 4)
+        etas_ceil   = [T_MAX] * N_PHASES
+        etas_floor  = [0.0]   * N_PHASES
+    T_raw = net(feat[:, :n_in])
+    corr_down = torch.zeros(N_PHASES)   # ceiling: reduce T when T_raw > ETA_ceil
+    corr_up   = torch.zeros(N_PHASES)   # floor:   raise T_mid when below ETA_floor
+    for k in range(N_PHASES):
+        excess = T_raw[k].item() - etas_ceil[k]
+        if excess > 0.0:
+            corr_down[k] = math.ceil(excess / _ETA_STEP) * _ETA_STEP
+        # floor is checked against the post-ceiling intermediate value so that
+        # step-rounding overshoot of corr_down cannot leave T_mid below ETA_floor
+        T_mid   = T_raw[k].item() - float(corr_down[k])
+        deficit = etas_floor[k] - T_mid
+        if deficit > 0.0:
+            corr_up[k] = math.ceil(deficit / _ETA_STEP) * _ETA_STEP
+    T_all = (T_raw - corr_down + corr_up).clamp(min=T_MIN)
+    cs, es = cycle_boundaries(T_all, t0)
+    return T_all, cs, es, float(es[-1].item()) + T_AR
+
+
+class RollingHorizonSignal:
+    """Rolling-horizon NN signal controller — single source of timing logic.
+
+    Phases step 0 → 1 → 2 → 3 → 0 → …  The NN is queried `lookahead` seconds
+    before each phase ends; only T[next_phase] from that prediction is consumed.
+    All other outputs are discarded and re-predicted when their own lookahead
+    window arrives, so the controller is reactive to the live queue state every
+    phase transition.
+
+    Differentiable: c_stack / e_stack carry a live tensor for the active phase
+    so gradient flows net → T_k → e_stack[k] → soft_role → loss.  Past and
+    future phases get neutral placeholders (±1000 s) that drive soft_role to ≈ 0.
+    Phases run on default timing until WARMUP_T; NN takes over after that.
+
+    Training (gradient flows through active phase):
+        rh = RollingHorizonSignal(net)
+        for step in ...:
+            green, c_stack, e_stack = rh.step(t, s_act, v_act, mv_act, s_junc)
+            role = soft_role(t, c_stack, e_stack, mv_act)
+
+    Inference (cosim_sumo — wrap in no_grad):
+        rh = RollingHorizonSignal(net)
+        with torch.no_grad():
+            green, *_ = rh.step(t, s_act, v_act, mv_act, s_junc)
+    """
+
+    def __init__(self, net: "PhaseNet", lookahead: float = 5.0):
+        self.net      = net
+        self.lookahead = lookahead
+        self.reset()
+
+    def reset(self) -> None:
+        self._phase     = 0
+        self._phase_end = float(_DEFAULT_T[0].item())
+        self._in_ar     = False
+        self._ar_end    = 0.0
+        self._next_T    = {k: float(_DEFAULT_T[k].item()) for k in range(N_PHASES)}
+        self._T_tensor  = {}   # phase_k → T tensor (may carry grad in training)
+        self._pred_for  = -1   # last phase predicted for (-1 = none)
+        self._active    = False
+        self.c_stack    = torch.zeros(N_PHASES)
+        self.e_stack    = torch.zeros(N_PHASES)
+        self._build_stacks(0.0, _DEFAULT_T[0].detach().clone())
+
+    def step(self, t: float,
+             s_act: torch.Tensor, v_act: torch.Tensor,
+             mv_act: torch.Tensor, s_junc: torch.Tensor):
+        """Advance signal to time t; return (green_frozenset, c_stack, e_stack).
+
+        Call once per simulation step with the current active-vehicle tensors.
+        Gradient context is the caller's responsibility.
+        """
+        if not self._active and t >= WARMUP_T:
+            self._active = True
+
+        if self._in_ar:
+            if t >= self._ar_end:
+                self._in_ar   = False
+                self._phase   = (self._phase + 1) % N_PHASES
+                T_k = self._T_tensor.get(
+                    self._phase, _DEFAULT_T[self._phase].detach().clone())
+                self._phase_end = t + float(T_k.item())
+                self._build_stacks(t, T_k)
+                self._pred_for = -1
+        else:
+            next_ph = (self._phase + 1) % N_PHASES
+            if (self._active
+                    and self._pred_for != next_ph
+                    and t >= self._phase_end - self.lookahead):
+                T_all, _, _, _ = nn_cycle(self.net, s_act, v_act, mv_act, s_junc, t)
+                self._next_T[next_ph]   = float(T_all[next_ph].item())
+                self._T_tensor[next_ph] = T_all[next_ph]
+                self._pred_for = next_ph
+            if t >= self._phase_end:
+                self._in_ar = True
+                self._ar_end = t + T_AR
+
+        green = frozenset() if self._in_ar else _PHASE_GREEN[self._phase]
+        return green, self.c_stack, self.e_stack
+
+    def _build_stacks(self, t_start: float, T_k: torch.Tensor) -> None:
+        """Rebuild c/e stacks: active phase live, others get ±1000 s placeholders."""
+        k = self._phase
+        c_vals, e_vals = [], []
+        for j in range(N_PHASES):
+            if j == k:
+                c_j = torch.tensor(t_start, dtype=torch.float32)
+                e_j = c_j + T_k                         # differentiable through T_k
+            elif j < k:                                  # already ran this pass
+                c_j = torch.tensor(t_start - 1000.0)
+                e_j = torch.tensor(t_start - 999.0)
+            else:                                        # not yet started
+                c_j = torch.tensor(t_start + 1000.0)
+                e_j = torch.tensor(t_start + 1001.0)
+            c_vals.append(c_j)
+            e_vals.append(e_j)
+        self.c_stack = torch.stack(c_vals)
+        self.e_stack = torch.stack(e_vals)
 
 
 # ── opportunistic movement gap check ─────────────────────────────────────────
@@ -246,12 +431,15 @@ def _active_phase_idx(t: float, c_stack: torch.Tensor,
 
 def compute_opp(t: float, v_a: torch.Tensor, mv_a: torch.Tensor,
                 d_junc_a: torch.Tensor,
-                c_stack: torch.Tensor, e_stack: torch.Tensor) -> torch.Tensor:
+                c_stack: torch.Tensor, e_stack: torch.Tensor,
+                opp_timers=None) -> torch.Tensor:
     """Opportunistic flag [Na] — 1.0 for the leader of each non-active phase
     that has a certified ≥_OPP_GAP_MIN s gap in the active-phase conflict stream.
 
     Active-phase ETAs: constant-speed to conflict point (vehicles already moving).
     Leader ETAs: free-flow kinematic to conflict point (same estimator as phase_eta).
+    opp_timers  dict|None  per-phase cooldown: maps phase_index → expiry time (s);
+                           mutated in-place when conflicts are resolved.
     All plain Python floats — no autograd involvement.
     """
     Na  = len(v_a)
@@ -259,6 +447,13 @@ def compute_opp(t: float, v_a: torch.Tensor, mv_a: torch.Tensor,
     ak  = _active_phase_idx(t, c_stack, e_stack)
     if ak < 0:
         return opp   # all-red: no opportunistic movement
+
+    # Re-test: if the scheduled re-test time has passed, lift all per-phase
+    # latches and run a fresh full selection.
+    if opp_timers is not None and t >= opp_timers.get('_retest', float('inf')):
+        for _k in [_k for _k in opp_timers if isinstance(_k, int)]:
+            del opp_timers[_k]
+        opp_timers.pop('_retest', None)
 
     mv_list   = mv_a.tolist()
     active_mvs = _PHASE_GREEN[ak]
@@ -282,11 +477,31 @@ def compute_opp(t: float, v_a: torch.Tensor, mv_a: torch.Tensor,
     else:
         eta_active = []
 
-    # Pass 1: collect candidates — (veh_idx, eta_at_conflict, queue_size)
+    # Non-active-phase vehicles already in the box are committed opp vehicles
+    # from prior steps; include them as rivals so the pass-3 loser can't slip
+    # through once the winner enters the box and leaves the candidates list.
+    non_active_inbox = (~in_active) & (d_junc_a <= 0.0) & \
+                       (d_junc_a > -(_OPP_D_CONFLICT + utils.L_VEH))
+    if non_active_inbox.any():
+        for _dc, _vc in zip(
+                (d_junc_a[non_active_inbox] + _OPP_D_CONFLICT).clamp(min=0.0).tolist(),
+                v_a[non_active_inbox].clamp(min=0.0).tolist()):
+            _a  = _ETA_A_MAX
+            _da = max(0.0, (utils.V0 ** 2 - _vc ** 2) / (2.0 * _a))
+            if _dc <= _da:
+                eta_active.append(
+                    (-_vc + math.sqrt(max(_vc ** 2 + 2.0 * _a * _dc, 0.0))) / _a)
+            else:
+                eta_active.append((utils.V0 - _vc) / _a + (_dc - _da) / utils.V0)
+
+    # Pass 1: collect candidates — compute free-flow ETAs for ALL approaching vehicles.
+    # Candidate: (sorted_veh_indices, eta_lead, sorted_etas, phase_k)
     candidates = []
     for k in range(N_PHASES):
         if k == ak:
             continue
+        if opp_timers is not None and opp_timers.get(k, 0.0) > t:
+            continue  # cooldown active for this phase
         phase_mvs = _PHASE_GREEN[k]
         in_phase  = torch.tensor([int(m) in phase_mvs for m in mv_list], dtype=torch.bool)
         appr      = in_phase & (d_junc_a > 0.0) & (d_junc_a < _ETA_RANGE)
@@ -294,42 +509,69 @@ def compute_opp(t: float, v_a: torch.Tensor, mv_a: torch.Tensor,
             continue
         appr_idx = appr.nonzero().flatten()
         d_appr   = d_junc_a[appr]
-        loc      = int(d_appr.argmin())
-        d_lead   = float(d_appr[loc])
-        v_lead_  = float(v_a[appr][loc])
-        queue    = int(appr.sum())
+        v0, a    = utils.V0, _ETA_A_MAX
 
-        d_conf  = d_lead + _OPP_D_CONFLICT
-        v0, a   = utils.V0, _ETA_A_MAX
-        d_accel = max(0.0, (v0 ** 2 - v_lead_ ** 2) / (2.0 * a))
-        if d_conf <= d_accel:
-            eta_lead = (-v_lead_ + math.sqrt(max(v_lead_ ** 2 + 2.0 * a * d_conf, 0.0))) / a
-        else:
-            eta_lead = (v0 - v_lead_) / a + (d_conf - d_accel) / v0
+        etas_all = []
+        for _dc, _vc in zip(
+                (d_appr + _OPP_D_CONFLICT).clamp(min=0.0).tolist(),
+                v_a[appr].clamp(min=0.0).tolist()):
+            _da = max(0.0, (v0 ** 2 - _vc ** 2) / (2.0 * a))
+            if _dc <= _da:
+                etas_all.append((-_vc + math.sqrt(max(_vc ** 2 + 2.0 * a * _dc, 0.0))) / a)
+            else:
+                etas_all.append((v0 - _vc) / a + (_dc - _da) / v0)
 
-        candidates.append((int(appr_idx[loc]), eta_lead, queue))
+        order    = sorted(range(len(etas_all)), key=lambda i: etas_all[i])
+        etas_srt = [etas_all[i] for i in order]
+        idx_srt  = [int(appr_idx[i]) for i in order]
+        candidates.append((idx_srt, etas_srt[0], etas_srt, k))
 
     if not candidates:
         return opp
 
-    # Pass 2: filter by active-phase gap only
+    # Pass 2: check leader gap against active stream; determine the gap window and
+    # count how many vehicles fit — the last passable vehicle defines eta_last.
+    # eta_last (not eta_lead) is what must clear _OPP_GAP_MIN before the next
+    # active-phase arrival.
+    # Feasible candidate: (passable_indices, eta_lead, passable_count, eta_last, phase_k)
     feasible = []
-    for veh_idx, eta_i, queue_i in candidates:
-        before = [eta_i - e for e in eta_active if e < eta_i]
-        after  = [e - eta_i for e in eta_active if e > eta_i]
-        if (not before or min(before) >= _OPP_GAP_MIN) and \
-           (not after  or min(after)  >= _OPP_GAP_MIN):
-            feasible.append((veh_idx, eta_i, queue_i))
+    for veh_indices, eta_lead, etas_srt, phase_k in candidates:
+        before = [eta_lead - e for e in eta_active if e < eta_lead]
+        after  = [e - eta_lead for e in eta_active if e > eta_lead]
+        if not ((not before or min(before) >= _OPP_BEFORE_MIN) and
+                (not after  or min(after)  >= _OPP_GAP_MIN)):
+            continue  # leader does not fit in the gap
 
-    # Pass 3: resolve inter-candidate conflicts by queue priority (greedy).
+        eta_next_active = min((e for e in eta_active if e > eta_lead), default=float('inf'))
+        eta_window_end  = eta_next_active - _OPP_GAP_MIN
+
+        passable = [idx for idx, eta in zip(veh_indices, etas_srt) if eta <= eta_window_end]
+        eta_last = etas_srt[len(passable) - 1]
+        feasible.append((passable, eta_lead, len(passable), eta_last, phase_k))
+
+    # Pass 3: resolve inter-candidate conflicts by minimum ETA (greedy).
+    # Two candidates conflict when their ETA intervals [eta_lead, eta_last] overlap
+    # within _OPP_GAP_MIN.  Winner: smallest eta_lead (fastest to clear junction).
+    # Losers are latched for _OPP_LATCH_DUR s; winner is NOT latched so it keeps
+    # receiving opp=1 each step.  A re-test fires at t + _OPP_RETEST_DT so
+    # changed conditions can promote a new winner.
     n        = len(feasible)
-    conflict = [[abs(feasible[i][1] - feasible[j][1]) < _OPP_GAP_MIN
+    conflict = [[feasible[i][3] + _OPP_GAP_MIN > feasible[j][1] and
+                 feasible[j][3] + _OPP_GAP_MIN > feasible[i][1]
                  for j in range(n)] for i in range(n)]
     remaining = set(range(n))
     while remaining:
-        best = max(remaining, key=lambda i: feasible[i][2])
-        opp[feasible[best][0]] = 1.0
-        remaining -= {best} | {j for j in remaining if conflict[best][j]}
+        best = min(remaining, key=lambda i: feasible[i][1])   # min eta_lead
+        for idx in feasible[best][0]:
+            opp[idx] = 1.0
+        losers = {j for j in remaining if j != best and conflict[best][j]}
+        if opp_timers is not None and losers:
+            expiry = t + _OPP_LATCH_DUR
+            for j in losers:
+                opp_timers[feasible[j][4]] = expiry            # phase_k key
+            opp_timers['_retest'] = min(
+                opp_timers.get('_retest', float('inf')), t + _OPP_RETEST_DT)
+        remaining -= {best} | losers
 
     return opp
 
@@ -359,42 +601,11 @@ def simulate_differentiable(events: list, net: PhaseNet,
     move   = torch.tensor([e[1] for e in events], dtype=torch.long, device=device)
     s      = torch.zeros(Ntot, device=device)
     v      = torch.zeros(Ntot, device=device)
-    state  = torch.zeros(Ntot, dtype=torch.long, device=device)
-    prev_a = torch.zeros(Ntot, device=device)
+    state      = torch.zeros(Ntot, dtype=torch.long, device=device)
+    prev_a     = torch.zeros(Ntot, device=device)
+    opp_timers = {}   # phase_k → absolute expiry time (s); mutated by compute_opp
 
-    # ── signal timing ─────────────────────────────────────────────────────────
-    nn_active = False
-    # Warm-up: fixed default timing (no NN, no gradient) for first WARMUP_T s
-    def _default_cycle(t0):
-        T = _DEFAULT_T.clone().detach().to(device)
-        cs, es = cycle_boundaries(T, t0)
-        return T, cs, es, float(es[-1].item()) + T_AR
-
-    _net_n_in = net.embed[0].in_features if hasattr(net, "embed") else 4
-
-    def _nn_cycle(t0):
-        act = (state == 1).nonzero().flatten()
-        if len(act) > 0:
-            feat = phase_features(s[act], v[act], move[act], s_junc)
-            etas = phase_eta(s[act], v[act], move[act], s_junc)
-        else:
-            feat = torch.zeros(N_PHASES, 4, device=device)
-            etas = [T_MAX] * N_PHASES
-        T_raw = net(feat[:, :_net_n_in])
-        # ── FGD projection: enforce T_k ≤ ETA_k ──────────────────────────────
-        # corr is a plain float tensor — no autograd involvement.
-        # Gradient flows through T_raw unchanged; the net is penalised for
-        # violations on the next backward pass.
-        corr = torch.zeros(N_PHASES)
-        for k in range(N_PHASES):
-            excess = T_raw[k].item() - etas[k]
-            if excess > 0.0:
-                corr[k] = math.ceil(excess / _ETA_STEP) * _ETA_STEP
-        T_all = (T_raw - corr).clamp(min=T_MIN)
-        cs, es = cycle_boundaries(T_all, t0)
-        return T_all, cs, es, float(es[-1].item()) + T_AR
-
-    _, c_stack, e_stack, cycle_end = _default_cycle(0.0)
+    rh_signal = RollingHorizonSignal(net)
 
     n_steps      = int(t_end / dt)
     delay_loss   = torch.zeros(1, device=device)
@@ -404,13 +615,6 @@ def simulate_differentiable(events: list, net: PhaseNet,
 
     for step in range(n_steps):
         t = step * dt
-
-        # Switch from warm-up to NN at WARMUP_T
-        if not nn_active and t >= WARMUP_T:
-            nn_active = True
-            _, c_stack, e_stack, cycle_end = _nn_cycle(t)
-        elif nn_active and t >= cycle_end:
-            _, c_stack, e_stack, cycle_end = _nn_cycle(cycle_end)
 
         # ── spawn (O(M) Python loop — M=12, cheap relative to vehicle ops) ────
         for mi in range(M):
@@ -431,21 +635,24 @@ def simulate_differentiable(events: list, net: PhaseNet,
                     s[k_v]     = utils.L_VEH
                     v[k_v]     = min(S.V_PHYS, v_safe)
 
-        act = (state == 1).nonzero().flatten()
-        Na  = len(act)
+        act  = (state == 1).nonzero().flatten()
+        Na   = len(act)
+        s_a  = s[act] if Na > 0 else s[:0]
+        v_a  = v[act] if Na > 0 else v[:0]
+        mv_a = move[act] if Na > 0 else move[:0]
+
+        _, c_stack, e_stack = rh_signal.step(t, s_a, v_a, mv_a, s_junc)
+
         if Na == 0:
             continue
 
-        s_a      = s[act]
-        v_a      = v[act]
-        mv_a     = move[act]
         d_junc_a = s_junc[mv_a] - s_a   # [Na]  +ve = approaching
 
         # ── soft role (fully vectorised) ──────────────────────────────────────
         role  = soft_role(t, c_stack, e_stack, mv_a)
         role  = (role + (d_junc_a < 0.0).float()).clamp(0.0, 1.0)
         # Opportunistic flag: plain tensor, no autograd — gradient flows through role only
-        opp_a = compute_opp(t, v_a, mv_a, d_junc_a, c_stack, e_stack)
+        opp_a = compute_opp(t, v_a, mv_a, d_junc_a, c_stack, e_stack, opp_timers=opp_timers)
 
         # ── leader gap (vectorised O(Na²) → single batch op) ─────────────────
         appr_lane  = mv_a // 3                  # [Na] approach 0-3
